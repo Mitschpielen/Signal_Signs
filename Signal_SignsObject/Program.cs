@@ -513,6 +513,123 @@ public class PeakSigns : BaseUnityPlugin
         catch { return fallback; }
     }
 
+    private static string GetOwnerPlayerName(int ownerActor)
+    {
+        try
+        {
+            if (!PhotonNetwork.IsConnected || PhotonNetwork.CurrentRoom == null)
+                return "Player";
+
+            Photon.Realtime.Player p = PhotonNetwork.CurrentRoom.GetPlayer(ownerActor);
+            if (p == null || string.IsNullOrWhiteSpace(p.NickName))
+                return "Player";
+
+            return p.NickName;
+        }
+        catch
+        {
+            return "Player";
+        }
+    }
+
+    private static void AdjustTextSizeForName(TextMesh textMesh, string name)
+    {
+        // Legacy heuristic kept for compatibility; CreateSign now uses FitTextMeshToPanelBounds.
+        if (textMesh == null) return;
+
+        if (string.IsNullOrEmpty(name))
+        {
+            textMesh.characterSize = 0.08f;
+            return;
+        }
+
+        int len = name.Length;
+
+        const int maxComfortableChars = 10;  // looks good at base size
+        const int hardMaxChars = 25;         // very long names
+
+        float baseSize = 0.08f;
+        float minSize = 0.035f;
+
+        if (len <= maxComfortableChars)
+        {
+            textMesh.characterSize = baseSize;
+            return;
+        }
+
+        float t = Mathf.InverseLerp(maxComfortableChars, hardMaxChars, len);
+        float scaled = Mathf.Lerp(baseSize, minSize, t);
+        textMesh.characterSize = scaled;
+    }
+
+    private static void FitTextMeshToPanelBounds(TextMesh textMesh, float maxWidth, float maxHeight, float baseCharacterSize, float minCharacterSize)
+    {
+        if (textMesh == null) return;
+
+        var mr = textMesh.GetComponent<MeshRenderer>();
+        if (mr == null) return;
+
+        // Ensure renderer is on so bounds are valid.
+        mr.enabled = true;
+
+        string original = textMesh.text ?? string.Empty;
+        if (original.Length == 0)
+        {
+            textMesh.characterSize = baseCharacterSize;
+            return;
+        }
+
+        // 1) Shrink to fit (fast, robust).
+        textMesh.characterSize = baseCharacterSize;
+
+        // Avoid infinite loops if bounds are weird.
+        for (int i = 0; i < 20; i++)
+        {
+            Bounds b = mr.bounds;
+            float w = b.size.x;
+            float h = b.size.y;
+
+            // If bounds are degenerate, bail.
+            if (w <= 0.0001f || h <= 0.0001f)
+                break;
+
+            if (w <= maxWidth && h <= maxHeight)
+                return;
+
+            // Scale down proportionally by worst overflow.
+            float scaleW = maxWidth / w;
+            float scaleH = maxHeight / h;
+            float scale = Mathf.Min(scaleW, scaleH);
+
+            // In case we barely overflow, nudge a bit.
+            scale = Mathf.Clamp(scale, 0.75f, 0.98f);
+            float next = textMesh.characterSize * scale;
+
+            if (next >= textMesh.characterSize - 0.00001f)
+                next = textMesh.characterSize - 0.002f;
+
+            textMesh.characterSize = Mathf.Max(minCharacterSize, next);
+
+            if (textMesh.characterSize <= minCharacterSize + 0.00001f)
+                break;
+        }
+
+        // 2) Still not fitting at min size -> ellipsis to fit width.
+        for (int cut = original.Length; cut >= 1; cut--)
+        {
+            Bounds b = mr.bounds;
+            if (b.size.x <= maxWidth && b.size.y <= maxHeight)
+                return;
+
+            // Keep at least 1 char + …
+            int keep = Mathf.Max(1, cut - 1);
+            textMesh.text = original.Substring(0, keep) + "…";
+        }
+
+        // If nothing fits (shouldn't happen), keep a single dot.
+        textMesh.text = "…";
+    }
+
     private static object GetMemberValue(object obj, string name)
     {
         if (obj == null) return null;
@@ -909,6 +1026,20 @@ public class PeakSigns : BaseUnityPlugin
         ApplyUnlit(panel, ownerColor);
         ApplyUnlit(pole, Color.Lerp(ownerColor, Color.black, 0.45f));
 
+        // --- Player name label (world-space UI, depth-tested, both sides) ---
+        try
+        {
+            string playerName = GetOwnerPlayerName(ownerActor);
+            Material uiMat = CreateDepthTestedUiMaterial();
+
+            CreateNameLabelWorldUI(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness, isBackSide: false, uiMat: uiMat);
+            CreateNameLabelWorldUI(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness, isBackSide: true, uiMat: uiMat);
+        }
+        catch (Exception e)
+        {
+            Logger.LogWarning($"Failed to create sign label: {e}");
+        }
+
         return root;
     }
 
@@ -935,6 +1066,118 @@ public class PeakSigns : BaseUnityPlugin
         mr.enabled = true;
         mr.shadowCastingMode = ShadowCastingMode.On;
         mr.receiveShadows = true;
+    }
+
+    private static Font GetBuiltinArialFont()
+    {
+        // Built-in resource name in Unity
+        return Resources.GetBuiltinResource<Font>("Arial.ttf");
+    }
+
+    private static Material CreateDepthTestedUiMaterial()
+    {
+        // UI/Default is the standard for Unity UI Text and supports alpha.
+        Shader s = Shader.Find("UI/Default");
+        if (s == null)
+            s = Shader.Find("Sprites/Default");
+        if (s == null)
+            return null;
+
+        var m = new Material(s);
+
+        // Force depth test/write when supported by the shader.
+        if (m.HasProperty("_ZWrite")) m.SetFloat("_ZWrite", 1f);
+        if (m.HasProperty("_ZTest")) m.SetFloat("_ZTest", (float)CompareFunction.LessEqual);
+
+        // Keep in transparent range but depth-tested.
+        m.renderQueue = 3000;
+        return m;
+    }
+
+    private static void CreateNameLabelWorldUI(
+        Transform panel,
+        string text,
+        float panelWidth,
+        float panelHeight,
+        float tipLen,
+        float panelThickness,
+        bool isBackSide,
+        Material uiMat)
+    {
+        // Build a small world-space canvas stuck to the panel face.
+        var canvasGo = new GameObject(isBackSide ? "NameCanvasBack" : "NameCanvasFront");
+        canvasGo.transform.SetParent(panel, false);
+
+        var canvas = canvasGo.AddComponent<Canvas>();
+        canvas.renderMode = RenderMode.WorldSpace;
+        canvas.worldCamera = Camera.main;
+
+        // Make it deterministic and lightweight
+        canvasGo.AddComponent<CanvasScaler>();
+        canvasGo.AddComponent<GraphicRaycaster>();
+
+        // Place it on the face.
+        float z = (panelThickness * 0.5f) + 0.01f;
+        if (isBackSide)
+        {
+            canvasGo.transform.localPosition = new Vector3(-tipLen * 0.25f, 0f, -z);
+            // Rotate canvas to face outward from the back.
+            canvasGo.transform.localRotation = Quaternion.Euler(0f, 180f, 0f);
+        }
+        else
+        {
+            canvasGo.transform.localPosition = new Vector3(-tipLen * 0.25f, 0f, +z);
+            canvasGo.transform.localRotation = Quaternion.identity;
+        }
+
+        // Rect size (in UI units). We'll map 100 units = 1 world unit for easy math.
+        const float unitsPerWorld = 100f;
+
+        float padX = 0.12f;
+        float padY = 0.06f;
+        float usableWidthWorld = Mathf.Max(0.05f, panelWidth - tipLen - padX);
+        float usableHeightWorld = Mathf.Max(0.05f, panelHeight - padY);
+
+        var rt = canvas.GetComponent<RectTransform>();
+        rt.sizeDelta = new Vector2(usableWidthWorld * unitsPerWorld, usableHeightWorld * unitsPerWorld);
+        rt.localScale = Vector3.one / unitsPerWorld;
+
+        // Child Text
+        var textGo = new GameObject("Text");
+        textGo.transform.SetParent(canvasGo.transform, false);
+
+        var textRt = textGo.AddComponent<RectTransform>();
+        textRt.anchorMin = Vector2.zero;
+        textRt.anchorMax = Vector2.one;
+        textRt.offsetMin = Vector2.zero;
+        textRt.offsetMax = Vector2.zero;
+
+        var uiText = textGo.AddComponent<Text>();
+        uiText.text = text;
+        uiText.color = Color.black;
+        uiText.alignment = TextAnchor.MiddleCenter;
+        uiText.horizontalOverflow = HorizontalWrapMode.Overflow;
+        uiText.verticalOverflow = VerticalWrapMode.Overflow;
+
+        // Counteract mirroring that can happen with WorldSpace canvases on the back side.
+        // Keep the canvas facing the back, but flip the text content so glyphs read normally.
+        if (isBackSide)
+            textGo.transform.localScale = new Vector3(-1f, 1f, 1f);
+
+        uiText.font = GetBuiltinArialFont();
+        uiText.fontStyle = FontStyle.Bold;
+
+        // BestFit shrinks to keep within rect
+        uiText.resizeTextForBestFit = true;
+        uiText.resizeTextMinSize = 8;
+        uiText.resizeTextMaxSize = 48;
+
+        // Apply material if provided (depth-tested)
+        if (uiMat != null)
+            uiText.material = uiMat;
+
+        // Disable raycast so it doesn't interfere
+        uiText.raycastTarget = false;
     }
 }
 
