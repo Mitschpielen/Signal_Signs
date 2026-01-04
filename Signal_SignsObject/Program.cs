@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using BepInEx;
 using BepInEx.Configuration;
 using ExitGames.Client.Photon;
@@ -19,7 +20,7 @@ public class PeakSigns : BaseUnityPlugin
     private ConfigEntry<float> _deleteHoldSeconds;
     private ConfigEntry<float> _placeHoldSeconds;
 
-    // Farben
+    // Farben (UI Progress)
     private readonly Color _deleteColor = new Color(1f, 0.35f, 0.10f, 1f); // orange/rot
     private readonly Color _placeColor  = new Color(0.10f, 1.0f, 0.20f, 1f); // gruen
 
@@ -40,24 +41,34 @@ public class PeakSigns : BaseUnityPlugin
     private bool _progressReady;
 
     // -------- Photon Events --------
-    // Frei wählbare Event-Codes (nur nicht mit Spiel kollidieren; hohe Nummern sind meist ok)
     private const byte EVT_SPAWN_SIGN  = 101;
     private const byte EVT_DELETE_SIGN = 202;
+
+    // -------- Recolor Timer --------
+    private float _nextRecolorAt;
+    private const float RECOLOR_INTERVAL = 10f;
+
+    // -------- Cached Reflection Handles --------
+    private static object _cachedCustomization;          // Customization instance (Singleton<Customization>.Instance)
+    private static Type _ccType;                         // CharacterCustomization type
+    private static MethodInfo _ccGetDataMethod;          // method that returns customization data
+    private static bool _ccSearched;
 
     private void Awake()
     {
         _mouseButton = Config.Bind("Input", "MouseButton", 2, "2 = Middle Mouse (Mausrad-Klick)");
         _maxDistance = Config.Bind("Placement", "MaxDistance", 60f, "Maximale Distanz.");
 
-        _deleteHoldSeconds = Config.Bind("Delete", "HoldSeconds", 1.25f, "Hold-Zeit zum Löschen.");
-        _placeHoldSeconds  = Config.Bind("Placement", "HoldSeconds", 1.00f, "Hold-Zeit zum Platzieren.");
+        _deleteHoldSeconds = Config.Bind("Delete", "HoldSeconds", 1.0f, "Hold-Zeit zum Löschen.");
+        _placeHoldSeconds  = Config.Bind("Placement", "HoldSeconds", 0.025f, "Hold-Zeit zum Platzieren.");
 
-        Logger.LogInfo("Peak Signs 1.0.0 geladen. Place+Delete mit Progress + Multiplayer Sync (Photon).");
+        _nextRecolorAt = Time.unscaledTime + RECOLOR_INTERVAL;
+
+        Logger.LogInfo("Peak Signs 1.0.0 geladen. Place+Delete + MP Sync (Photon) + Owner-Farbe + Recolor alle 10s.");
     }
 
     private void OnEnable()
     {
-        // Photon Event Hook
         if (PhotonNetwork.NetworkingClient != null)
             PhotonNetwork.NetworkingClient.EventReceived += OnPhotonEvent;
     }
@@ -78,6 +89,13 @@ public class PeakSigns : BaseUnityPlugin
         if (!_progressReady)
             TrySetupUseItemProgress();
 
+        // ---- Alle 10 Sekunden Farben nachfärben ----
+        if (Time.unscaledTime >= _nextRecolorAt)
+        {
+            _nextRecolorAt = Time.unscaledTime + RECOLOR_INTERVAL;
+            RefreshAllSignsColors();
+        }
+
         int btn = _mouseButton.Value;
 
         if (Input.GetMouseButtonDown(btn))
@@ -86,7 +104,6 @@ public class PeakSigns : BaseUnityPlugin
             _holdStart = Time.unscaledTime;
             _placedThisHold = false;
 
-            // initial check
             _deleteTarget = GetSignUnderCrosshair();
         }
 
@@ -94,8 +111,6 @@ public class PeakSigns : BaseUnityPlugin
         {
             float held = Time.unscaledTime - _holdStart;
 
-            // Während Hold: wenn wir noch nicht platziert haben, darf sich Target ändern
-            // (z.B. du fängst frei an zu halten, zielst dann auf Schild -> soll löschen)
             if (!_placedThisHold)
                 _deleteTarget = GetSignUnderCrosshair();
 
@@ -108,7 +123,6 @@ public class PeakSigns : BaseUnityPlugin
 
                 if (held >= _deleteHoldSeconds.Value)
                 {
-                    // Schild-ID finden (Root hat Marker, wir speichern IDs in Dictionary -> suchen)
                     int id = FindIdForSignObject(_deleteTarget);
                     if (id != 0)
                         RequestDelete(id);
@@ -128,14 +142,13 @@ public class PeakSigns : BaseUnityPlugin
 
             if (!_placedThisHold && held >= _placeHoldSeconds.Value)
             {
-                // Spawn an visiertem Punkt
                 if (TryGetPlacement(out Vector3 pos, out Quaternion rot))
                 {
                     int id = GenerateSignId();
                     RequestSpawn(id, pos, rot);
                     _placedThisHold = true;
                 }
-                // Nach Platzierung: Progress aus (oder lass ihn kurz stehen, wenn du willst)
+
                 ShowProgress(false, _placeColor);
             }
         }
@@ -155,10 +168,10 @@ public class PeakSigns : BaseUnityPlugin
 
     private void RequestSpawn(int id, Vector3 pos, Quaternion rot)
     {
-        // Lokal spawnen
-        SpawnLocal(id, pos, rot);
+        int ownerActor = (PhotonNetwork.IsConnected ? PhotonNetwork.LocalPlayer.ActorNumber : 0);
 
-        // Multiplayer: an andere schicken
+        SpawnLocal(id, ownerActor, pos, rot);
+
         if (IsInMultiplayerRoom())
         {
             object[] data = new object[]
@@ -175,10 +188,8 @@ public class PeakSigns : BaseUnityPlugin
 
     private void RequestDelete(int id)
     {
-        // Lokal löschen
         DeleteLocal(id);
 
-        // Multiplayer: an andere schicken
         if (IsInMultiplayerRoom())
         {
             object[] data = new object[] { id };
@@ -207,7 +218,9 @@ public class PeakSigns : BaseUnityPlugin
             float qz = Convert.ToSingle(data[6]);
             float qw = Convert.ToSingle(data[7]);
 
-            SpawnLocal(id, new Vector3(px, py, pz), new Quaternion(qx, qy, qz, qw));
+            int ownerActor = photonEvent.Sender;
+
+            SpawnLocal(id, ownerActor, new Vector3(px, py, pz), new Quaternion(qx, qy, qz, qw));
         }
         else if (photonEvent.Code == EVT_DELETE_SIGN)
         {
@@ -221,7 +234,6 @@ public class PeakSigns : BaseUnityPlugin
 
     private bool IsInMultiplayerRoom()
     {
-        // "InRoom" deckt i.d.R. Multiplayer ab
         return PhotonNetwork.IsConnected && PhotonNetwork.InRoom;
     }
 
@@ -229,15 +241,17 @@ public class PeakSigns : BaseUnityPlugin
     // Spawn/Delete Local
     // =========================
 
-    private void SpawnLocal(int id, Vector3 groundPos, Quaternion rot)
+    private void SpawnLocal(int id, int ownerActor, Vector3 groundPos, Quaternion rot)
     {
         if (_signsById.ContainsKey(id))
-            return; // schon da
+            return;
 
-        GameObject sign = CreateSign(groundPos, rot);
+        Color ownerColor = GetOwnerPlayerColor(ownerActor);
+
+        GameObject sign = CreateSign(groundPos, rot, id, ownerActor, ownerColor);
         _signsById[id] = sign;
 
-        Logger.LogInfo($"Schild gespawnt id={id} pos={groundPos}");
+        Logger.LogInfo($"Schild gespawnt id={id} ownerActor={ownerActor} pos={groundPos}");
     }
 
     private void DeleteLocal(int id)
@@ -253,7 +267,6 @@ public class PeakSigns : BaseUnityPlugin
 
     private int FindIdForSignObject(GameObject signObj)
     {
-        // signObj ist unser Root (PeakSign), oder Child -> wir gehen auf Marker-Root
         PeakSignMarker marker = signObj.GetComponent<PeakSignMarker>();
         if (marker == null) marker = signObj.GetComponentInParent<PeakSignMarker>();
         GameObject root = marker != null ? marker.gameObject : signObj;
@@ -268,13 +281,248 @@ public class PeakSigns : BaseUnityPlugin
 
     private int GenerateSignId()
     {
-        // einfache ID; robust genug für kleine Mods
         int id;
         do
         {
             id = UnityEngine.Random.Range(100000, int.MaxValue);
         } while (_signsById.ContainsKey(id));
         return id;
+    }
+
+    // =========================
+    // Owner Color (Skin/Customization via Reflection)
+    // =========================
+
+    private static object GetCustomizationInstanceReflect()
+    {
+        if (_cachedCustomization != null)
+            return _cachedCustomization;
+
+        try
+        {
+            Type singletonOpen = null;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                singletonOpen = asm.GetType("Zorro.Core.Singleton`1", false);
+                if (singletonOpen != null) break;
+            }
+            if (singletonOpen == null) return null;
+
+            Type singletonClosed = singletonOpen.MakeGenericType(typeof(Customization));
+
+            var prop = singletonClosed.GetProperty("Instance",
+                BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static);
+
+            if (prop == null) return null;
+
+            _cachedCustomization = prop.GetValue(null, null);
+            return _cachedCustomization;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void EnsureCharacterCustomizationMethod()
+    {
+        if (_ccSearched) return;
+        _ccSearched = true;
+
+        try
+        {
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                var t = asm.GetType("CharacterCustomization", false);
+                if (t != null)
+                {
+                    _ccType = t;
+                    break;
+                }
+            }
+
+            if (_ccType == null)
+                return;
+
+            MethodInfo best = null;
+
+            var methods = _ccType.GetMethods(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Static | BindingFlags.Instance);
+            foreach (var m in methods)
+            {
+                var ps = m.GetParameters();
+                if (ps == null || ps.Length != 1) continue;
+
+                var p0 = ps[0].ParameterType;
+                if (!p0.IsAssignableFrom(typeof(Photon.Realtime.Player)) && !typeof(Photon.Realtime.Player).IsAssignableFrom(p0))
+                    continue;
+
+                var rt = m.ReturnType;
+                if (rt == typeof(void)) continue;
+
+                bool hasCurrentSkin =
+                    rt.GetField("currentSkin", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance) != null
+                    || rt.GetProperty("currentSkin", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance) != null;
+
+                if (hasCurrentSkin || rt.Name.IndexOf("Customization", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    best = m;
+                    if (hasCurrentSkin) break;
+                }
+            }
+
+            _ccGetDataMethod = best;
+        }
+        catch
+        {
+            _ccType = null;
+            _ccGetDataMethod = null;
+        }
+    }
+
+    private static int GetCurrentSkinIndexForPlayer(Photon.Realtime.Player ownerPlayer)
+    {
+        try
+        {
+            EnsureCharacterCustomizationMethod();
+            if (_ccType == null || _ccGetDataMethod == null)
+                return -1;
+
+            object instance = null;
+            if (!_ccGetDataMethod.IsStatic)
+            {
+                // FIX für CS0618: statt FindObjectOfType(Type) -> FindAnyObjectByType(Type)
+                if (typeof(UnityEngine.Object).IsAssignableFrom(_ccType))
+                {
+                    instance = UnityEngine.Object.FindAnyObjectByType(_ccType);
+                    if (instance == null) return -1;
+                }
+                else
+                {
+                    return -1;
+                }
+            }
+
+            object dataObj = _ccGetDataMethod.Invoke(instance, new object[] { ownerPlayer });
+            if (dataObj == null) return -1;
+
+            object curSkinObj = GetMemberValue(dataObj, "currentSkin");
+            if (curSkinObj == null) return -1;
+
+            return Convert.ToInt32(curSkinObj);
+        }
+        catch
+        {
+            return -1;
+        }
+    }
+
+    private static Color GetOwnerPlayerColor(int ownerActor)
+    {
+        Color fallback = new Color(1f, 0.95f, 0.2f, 1f);
+
+        try
+        {
+            if (!PhotonNetwork.IsConnected || PhotonNetwork.CurrentRoom == null)
+                return fallback;
+
+            Photon.Realtime.Player ownerPlayer = PhotonNetwork.CurrentRoom.GetPlayer(ownerActor);
+            if (ownerPlayer == null)
+                return fallback;
+
+            object customizationObj = GetCustomizationInstanceReflect();
+            if (customizationObj == null)
+                return fallback;
+
+            Array skinsArray = GetMemberValue(customizationObj, "skins") as Array;
+            if (skinsArray == null || skinsArray.Length == 0)
+                return fallback;
+
+            int skinIndex = GetCurrentSkinIndexForPlayer(ownerPlayer);
+            if (skinIndex < 0)
+                return fallback;
+
+            skinIndex = Mathf.Clamp(skinIndex, 0, skinsArray.Length - 1);
+            object skinObj = skinsArray.GetValue(skinIndex);
+            if (skinObj == null)
+                return fallback;
+
+            object colorObj = GetMemberValue(skinObj, "color");
+            if (colorObj is Color c)
+            {
+                c.a = 1f;
+                return c;
+            }
+
+            return fallback;
+        }
+        catch (Exception e)
+        {
+            Debug.LogWarning("[PeakSigns] GetOwnerPlayerColor failed: " + e);
+            return fallback;
+        }
+    }
+
+    private static object GetMemberValue(object obj, string name)
+    {
+        if (obj == null) return null;
+
+        Type t = obj.GetType();
+
+        var f = t.GetField(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (f != null) return f.GetValue(obj);
+
+        var p = t.GetProperty(name, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (p != null) return p.GetValue(obj, null);
+
+        return null;
+    }
+
+    private void RefreshAllSignsColors()
+    {
+        if (GetCustomizationInstanceReflect() == null)
+            return;
+
+        foreach (var kv in _signsById)
+        {
+            GameObject root = kv.Value;
+            if (root == null) continue;
+
+            PeakSignMarker marker = root.GetComponent<PeakSignMarker>();
+            if (marker == null) continue;
+
+            Color ownerColor = GetOwnerPlayerColor(marker.OwnerActor);
+
+            Transform panelT = root.transform.Find("Panel");
+            if (panelT != null)
+                SetRendererColor(panelT.GetComponent<MeshRenderer>(), ownerColor);
+
+            Transform poleT = root.transform.Find("Pole");
+            if (poleT != null)
+                SetRendererColor(poleT.GetComponent<MeshRenderer>(), Color.Lerp(ownerColor, Color.black, 0.45f));
+        }
+    }
+
+    private static void SetRendererColor(MeshRenderer mr, Color c)
+    {
+        if (mr == null) return;
+
+        Material m = mr.material;
+        if (m == null)
+        {
+            Shader s0 = Shader.Find("Unlit/Color");
+            if (s0 == null) s0 = Shader.Find("Standard");
+            m = new Material(s0);
+            mr.material = m;
+        }
+
+        Shader s = Shader.Find("Unlit/Color");
+        if (s != null && mr.material.shader != s)
+            mr.material.shader = s;
+
+        if (mr.material.HasProperty("_Color"))
+            mr.material.color = c;
+
+        mr.enabled = true;
     }
 
     // =========================
@@ -333,7 +581,6 @@ public class PeakSigns : BaseUnityPlugin
             if (go == null) continue;
             if (!string.Equals(go.name, "UseItem", StringComparison.OrdinalIgnoreCase)) continue;
 
-            // bevorzugt "GAME" root, falls vorhanden
             if (go.transform.root != null &&
                 go.transform.root.name.IndexOf("GAME", StringComparison.OrdinalIgnoreCase) >= 0)
             {
@@ -469,7 +716,6 @@ public class PeakSigns : BaseUnityPlugin
             _progressRoot.SetActive(visible);
         }
 
-        // Position: Mitte + kleiner
         RectTransform rt = _progressRoot.GetComponent<RectTransform>();
         if (rt != null)
         {
@@ -477,12 +723,9 @@ public class PeakSigns : BaseUnityPlugin
             rt.anchorMax = new Vector2(0.5f, 0.5f);
             rt.pivot = new Vector2(0.5f, 0.5f);
 
-            // GENAU MITTE
             rt.anchoredPosition = new Vector2(180f, 0f);
-            // KLEINER (0.6 - 0.8 ist meist gut)
             rt.localScale = new Vector3(0.7f, 0.7f, 0.7f);
         }
-
     }
 
     private void SetProgress(float t)
@@ -496,10 +739,12 @@ public class PeakSigns : BaseUnityPlugin
     // Sign Visual + No Hitbox
     // =========================
 
-    private GameObject CreateSign(Vector3 groundPos, Quaternion rot)
+    private GameObject CreateSign(Vector3 groundPos, Quaternion rot, int signId, int ownerActor, Color ownerColor)
     {
         GameObject root = new GameObject("PeakSign");
-        root.AddComponent<PeakSignMarker>();
+        var marker = root.AddComponent<PeakSignMarker>();
+        marker.SignId = signId;
+        marker.OwnerActor = ownerActor;
 
         GameObject panel = GameObject.CreatePrimitive(PrimitiveType.Cube);
         panel.name = "Panel";
@@ -518,8 +763,8 @@ public class PeakSigns : BaseUnityPlugin
         MakeNoHitbox(panel);
         MakeNoHitbox(pole);
 
-        ApplyUnlit(panel, new Color(1f, 0.95f, 0.2f, 1f));
-        ApplyUnlit(pole, new Color(1f, 0.2f, 1f, 1f));
+        ApplyUnlit(panel, ownerColor);
+        ApplyUnlit(pole, Color.Lerp(ownerColor, Color.black, 0.45f));
 
         return root;
     }
@@ -527,8 +772,8 @@ public class PeakSigns : BaseUnityPlugin
     private static void MakeNoHitbox(GameObject go)
     {
         Collider c = go.GetComponent<Collider>();
-        if (c != null) c.isTrigger = true;  // blockt nicht
-        go.layer = 2; // Ignore Raycast (optional)
+        if (c != null) c.isTrigger = true;
+        go.layer = 2;
     }
 
     private static void ApplyUnlit(GameObject go, Color c)
@@ -550,4 +795,8 @@ public class PeakSigns : BaseUnityPlugin
     }
 }
 
-public class PeakSignMarker : MonoBehaviour { }
+public class PeakSignMarker : MonoBehaviour
+{
+    public int SignId;
+    public int OwnerActor;
+}
