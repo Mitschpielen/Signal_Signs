@@ -10,7 +10,7 @@ using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.UI;
 
-[BepInPlugin("com.mitsc.peaksigns", "Peak Signs", "1.0.0")]
+[BepInPlugin("com.mitsch.peaksigns", "Peak Signs", "1.0.0")]
 public class PeakSigns : BaseUnityPlugin
 {
     // -------- Config --------
@@ -68,7 +68,7 @@ public class PeakSigns : BaseUnityPlugin
 
         _nextRecolorAt = Time.unscaledTime + RECOLOR_INTERVAL;
 
-        Logger.LogInfo("Peak Signs 1.0.0 geladen. MP Sync + Owner-Farbe + Wall-Placement + RoomCache + Recolor alle 10s.");
+        Logger.LogInfo("Peak Signs 1.0.0 geladen. MP Sync + Owner-Farbe + Wand parallel zur Oberfläche + Recolor alle 10s.");
     }
 
     private void OnEnable()
@@ -205,6 +205,9 @@ public class PeakSigns : BaseUnityPlugin
             var opts = new RaiseEventOptions
             {
                 Receivers = ReceiverGroup.Others,
+                // Hinweis: AddToRoomCache lässt "Delete" für Late-Joiner mitlaufen,
+                // aber löscht nicht automatisch alte Spawn-Events aus dem Cache.
+                // Für viele Mods reicht das trotzdem, weil Delete danach verarbeitet wird.
                 CachingOption = EventCaching.AddToRoomCache
             };
 
@@ -344,6 +347,8 @@ public class PeakSigns : BaseUnityPlugin
         }
         else
         {
+            // rot wird für Wand nicht zwingend gebraucht (wir richten im CreateSign sauber aus),
+            // aber lassen es drin, falls du später rot mitschicken willst.
             Vector3 fwd = surfaceNormal;
             Vector3 up = Vector3.up;
             if (Vector3.Cross(up, fwd).sqrMagnitude < 0.0001f)
@@ -734,7 +739,7 @@ public class PeakSigns : BaseUnityPlugin
     }
 
     // =========================
-    // Arrow Mesh (doppelseitige Seiten)
+    // Arrow Mesh
     // =========================
 
     private static Mesh CreateArrowMesh(float width, float height, float thickness, float tipLength)
@@ -744,6 +749,7 @@ public class PeakSigns : BaseUnityPlugin
         float t = thickness;
         float tip = Mathf.Clamp(tipLength, 0.05f, w * 0.49f);
 
+        // 2D Pfeil (rechts) im XY
         Vector2[] p =
         {
             new Vector2(-w * 0.5f, -h * 0.5f),
@@ -851,56 +857,50 @@ public class PeakSigns : BaseUnityPlugin
         }
         else
         {
-            // Wand: Pole aus Wand raus, Panel am Ende
+            // ===== WAND / SCHRÄGE FLÄCHE =====
+            // Ziel: Panel soll PARALLEL zur Oberfläche sein.
             Vector3 n = surfaceNormal.normalized;
 
-// Pole Rotation: Cylinder-Achse (Y) auf Normal drehen
+            // Pole: Y-Achse -> Normal
             Quaternion poleRot = Quaternion.FromToRotation(Vector3.up, n);
-            
 
-// Pivot = Ende vom Pole (Anschlusspunkt fürs Schild)
-            Vector3 pivot = placePos + n * (poleLength + wallGap);
-
-// Pole Center sitzt halb raus
+            // Pole raus aus Wand
             Vector3 poleCenter = placePos + n * (poleLength * 0.5f + wallGap);
-
             pole.transform.position = poleCenter;
             pole.transform.rotation = poleRot;
             pole.transform.localScale = new Vector3(poleRadius, poleHalfHeight, poleRadius);
 
-// Panel Center initial am Pivot + halbe Dicke
+            // Pivot (Ende vom Pole)
+            Vector3 pivot = placePos + n * (poleLength + wallGap);
+
+            // Panel an Pivot + halbe Dicke (damit es nicht in die Wand clippt)
             panel.transform.position = pivot + n * (panelThickness * 0.5f + wallGap);
 
-// ---- Billboard auf Wand-Ebene (so wie du es aktuell hast, Pfeil zeigt zu dir) ----
+            // --- Panel Rotation: parallel zur Oberfläche ---
+            // Panel-Mesh liegt im lokalen XY, Dicke ist lokales Z.
+            // => panel.forward (Z) muss auf +/- Normal zeigen.
+            Vector3 forward = -n; // wenn Vorderseite "falsch" ist: forward = n;
+
+            // Arrow-Richtung (lokal +X) soll sinnvoll liegen: nimm Blickrichtung projiziert auf die Fläche
             Camera cam = Camera.main;
-            Vector3 toCam = cam != null ? (cam.transform.position - panel.transform.position) : -n;
+            Vector3 dirOnPlane = cam != null ? Vector3.ProjectOnPlane(cam.transform.forward, n) : Vector3.zero;
+            if (dirOnPlane.sqrMagnitude < 0.0001f)
+                dirOnPlane = Vector3.Cross(Vector3.up, n);
+            if (dirOnPlane.sqrMagnitude < 0.0001f)
+                dirOnPlane = Vector3.Cross(Vector3.forward, n);
+            dirOnPlane.Normalize();
 
-            Vector3 dirOnPlane = Vector3.ProjectOnPlane(toCam, n);
-            if (dirOnPlane.sqrMagnitude < 0.000001f)
-                dirOnPlane = Vector3.ProjectOnPlane(cam != null ? cam.transform.forward : Vector3.forward, n);
+            // Up so bauen, dass panel.right = dirOnPlane (damit Pfeil "in die Richtung" zeigt)
+            Vector3 up = Vector3.Cross(forward, dirOnPlane).normalized;
+            if (up.sqrMagnitude < 0.0001f)
+                up = Vector3.ProjectOnPlane(Vector3.up, forward).normalized;
 
-            if (dirOnPlane.sqrMagnitude < 0.000001f)
-                dirOnPlane = Vector3.Cross(n, Vector3.up);
+            panel.transform.rotation = Quaternion.LookRotation(forward, up);
 
-            Vector3 right = dirOnPlane.normalized;
-            Vector3 upOnPlane = Vector3.Cross(n, right).normalized;
-
-// forward = n (raus aus Wand), up = upOnPlane
-            Quaternion wallBillboard = Quaternion.LookRotation(n, upOnPlane);
-
-// falls du noch deinen -90° Pfeil-Adjust brauchst, lass ihn hier:
-            Quaternion arrowAdjust = Quaternion.AngleAxis(-90f, n);
-
-            panel.transform.rotation = wallBillboard * arrowAdjust;
-
-// ✅ JETZT: 180° drehen, ABER um den Pole-Pivot
-            panel.transform.RotateAround(pivot, n, 180f);
-
-// ✅ Panel wieder sauber am Pole-Ende platzieren (damit es nicht “driftet”)
-            panel.transform.position = pivot + n * (panelThickness * 0.5f + wallGap);
-
-
-
+            // Falls dein Pfeil auf der Fläche 90° verdreht ist, nutze genau eine Korrektur:
+            // panel.transform.rotation *= Quaternion.AngleAxis(90f, forward);
+            // oder:
+            // panel.transform.rotation *= Quaternion.AngleAxis(-90f, forward);
         }
 
         MakeNoHitbox(panel);
