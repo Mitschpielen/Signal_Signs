@@ -48,6 +48,9 @@ public class PeakSigns : BaseUnityPlugin
     private float _nextRecolorAt;
     private const float RECOLOR_INTERVAL = 10f;
 
+    // -------- Stable ID (verhindert Kollisionen) --------
+    private int _localCounter = 0;
+
     // -------- Cached Reflection Handles --------
     private static object _cachedCustomization;          // Customization instance (Singleton<Customization>.Instance)
     private static Type _ccType;                         // CharacterCustomization type
@@ -64,7 +67,7 @@ public class PeakSigns : BaseUnityPlugin
 
         _nextRecolorAt = Time.unscaledTime + RECOLOR_INTERVAL;
 
-        Logger.LogInfo("Peak Signs 1.0.0 geladen. Place+Delete + MP Sync (Photon) + Owner-Farbe + Recolor alle 10s.");
+        Logger.LogInfo("Peak Signs 1.0.0 geladen. MP Sync + Owner-Farbe + Recolor alle 10s + RoomCache (Late Joiner).");
     }
 
     private void OnEnable()
@@ -131,7 +134,6 @@ public class PeakSigns : BaseUnityPlugin
                     _isHolding = false;
                     ShowProgress(false, _deleteColor);
                 }
-
                 return;
             }
 
@@ -144,11 +146,10 @@ public class PeakSigns : BaseUnityPlugin
             {
                 if (TryGetPlacement(out Vector3 pos, out Quaternion rot))
                 {
-                    int id = GenerateSignId();
+                    int id = GenerateSignIdStable();
                     RequestSpawn(id, pos, rot);
                     _placedThisHold = true;
                 }
-
                 ShowProgress(false, _placeColor);
             }
         }
@@ -163,15 +164,17 @@ public class PeakSigns : BaseUnityPlugin
     }
 
     // =========================
-    // Multiplayer Requests
+    // Multiplayer Requests (mit RoomCache für Late Joiner)
     // =========================
 
     private void RequestSpawn(int id, Vector3 pos, Quaternion rot)
     {
         int ownerActor = (PhotonNetwork.IsConnected ? PhotonNetwork.LocalPlayer.ActorNumber : 0);
 
+        // Lokal
         SpawnLocal(id, ownerActor, pos, rot);
 
+        // MP: an andere + im RoomCache speichern (damit Late Joiner es sehen)
         if (IsInMultiplayerRoom())
         {
             object[] data = new object[]
@@ -181,19 +184,32 @@ public class PeakSigns : BaseUnityPlugin
                 rot.x, rot.y, rot.z, rot.w
             };
 
-            var opts = new RaiseEventOptions { Receivers = ReceiverGroup.Others };
+            var opts = new RaiseEventOptions
+            {
+                Receivers = ReceiverGroup.Others,
+                CachingOption = EventCaching.AddToRoomCache
+            };
             PhotonNetwork.RaiseEvent(EVT_SPAWN_SIGN, data, opts, SendOptions.SendReliable);
         }
     }
 
     private void RequestDelete(int id)
     {
+        // Lokal löschen
         DeleteLocal(id);
 
+        // MP: Delete ebenfalls in RoomCache speichern.
+        // Vorteil: Late Joiner bekommt Spawn + Delete -> sieht am Ende korrekt "nicht vorhanden".
+        // (Cache wächst, aber bei wenigen Schildern ok.)
         if (IsInMultiplayerRoom())
         {
             object[] data = new object[] { id };
-            var opts = new RaiseEventOptions { Receivers = ReceiverGroup.Others };
+
+            var opts = new RaiseEventOptions
+            {
+                Receivers = ReceiverGroup.Others,
+                CachingOption = EventCaching.AddToRoomCache
+            };
             PhotonNetwork.RaiseEvent(EVT_DELETE_SIGN, data, opts, SendOptions.SendReliable);
         }
     }
@@ -218,6 +234,7 @@ public class PeakSigns : BaseUnityPlugin
             float qz = Convert.ToSingle(data[6]);
             float qw = Convert.ToSingle(data[7]);
 
+            // Owner = Sender (bei gecachten Events bleibt Sender korrekt)
             int ownerActor = photonEvent.Sender;
 
             SpawnLocal(id, ownerActor, new Vector3(px, py, pz), new Quaternion(qx, qy, qz, qw));
@@ -279,13 +296,16 @@ public class PeakSigns : BaseUnityPlugin
         return 0;
     }
 
-    private int GenerateSignId()
+    // Stabil: ActorNumber + lokaler Counter (verhindert Kollisionen zwischen Spielern)
+    private int GenerateSignIdStable()
     {
-        int id;
-        do
-        {
-            id = UnityEngine.Random.Range(100000, int.MaxValue);
-        } while (_signsById.ContainsKey(id));
+        int actor = (PhotonNetwork.IsConnected ? PhotonNetwork.LocalPlayer.ActorNumber : 0);
+        _localCounter++;
+
+        // Upper bits: actor (bis ~1024 ok), lower bits: counter
+        // Ergebnis: pro Spieler quasi garantiert einzigartig.
+        int id = (actor << 20) ^ (_localCounter & 0xFFFFF);
+        if (id == 0) id = 1;
         return id;
     }
 
@@ -390,7 +410,6 @@ public class PeakSigns : BaseUnityPlugin
             object instance = null;
             if (!_ccGetDataMethod.IsStatic)
             {
-                // FIX für CS0618: statt FindObjectOfType(Type) -> FindAnyObjectByType(Type)
                 if (typeof(UnityEngine.Object).IsAssignableFrom(_ccType))
                 {
                     instance = UnityEngine.Object.FindAnyObjectByType(_ccType);
@@ -455,9 +474,8 @@ public class PeakSigns : BaseUnityPlugin
 
             return fallback;
         }
-        catch (Exception e)
+        catch
         {
-            Debug.LogWarning("[PeakSigns] GetOwnerPlayerColor failed: " + e);
             return fallback;
         }
     }
@@ -526,7 +544,7 @@ public class PeakSigns : BaseUnityPlugin
     }
 
     // =========================
-    // Placement Raycast (Ping-Style)
+    // Placement Raycast
     // =========================
 
     private bool TryGetPlacement(out Vector3 groundPos, out Quaternion rot)
@@ -642,11 +660,6 @@ public class PeakSigns : BaseUnityPlugin
         ShowProgress(false, _deleteColor);
 
         _progressReady = (_progressFill != null);
-
-        Logger.LogInfo("✅ Progress UI bereit (UseItem): root=" + root.name +
-                       " | fillName=" + best.name +
-                       " | fillMethod=" + best.fillMethod +
-                       " | ok=" + _progressReady);
     }
 
     private static void StripAnimators(GameObject root)
@@ -723,78 +736,10 @@ public class PeakSigns : BaseUnityPlugin
             rt.anchorMax = new Vector2(0.5f, 0.5f);
             rt.pivot = new Vector2(0.5f, 0.5f);
 
+            // dein Offset/Scale
             rt.anchoredPosition = new Vector2(180f, 0f);
             rt.localScale = new Vector3(0.7f, 0.7f, 0.7f);
         }
-    }
-    private static Mesh CreateArrowMesh(float width, float height, float thickness, float tipLength)
-    {
-        float w = width;
-        float h = height;
-        float t = thickness;
-        float tip = Mathf.Clamp(tipLength, 0.05f, w * 0.49f);
-
-        // 2D Pfeil (rechts)
-        // links: Rechteck, rechts: Spitze
-        Vector2[] p =
-        {
-            new Vector2(-w * 0.5f, -h * 0.5f),         // 0 hinten-unten
-            new Vector2( w * 0.5f - tip, -h * 0.5f),   // 1 vorne-unten (vor Spitze)
-            new Vector2( w * 0.5f, 0f),                // 2 Spitze
-            new Vector2( w * 0.5f - tip,  h * 0.5f),   // 3 vorne-oben (vor Spitze)
-            new Vector2(-w * 0.5f,  h * 0.5f),         // 4 hinten-oben
-        };
-
-        // Extrusion entlang Z: vorne (z=+t/2) und hinten (z=-t/2)
-        int n = p.Length;
-        var verts = new Vector3[n * 2];
-
-        float zF = +t * 0.5f;
-        float zB = -t * 0.5f;
-
-        for (int i = 0; i < n; i++)
-        {
-            verts[i] = new Vector3(p[i].x, p[i].y, zF);       // Front
-            verts[i + n] = new Vector3(p[i].x, p[i].y, zB);   // Back
-        }
-
-        // Triangulation für Front (Polygon 0-1-2-3-4)
-        // Front (CCW)
-        var tris = new List<int>();
-
-        // Front face fan um 0: (0,1,2) (0,2,3) (0,3,4)
-        tris.AddRange(new[] { 0, 1, 2,  0, 2, 3,  0, 3, 4 });
-
-        // Back face (reverse winding) mit Offset n
-        tris.AddRange(new[] { n + 0, n + 2, n + 1,  n + 0, n + 3, n + 2,  n + 0, n + 4, n + 3 });
-
-        // Seitenflächen (doppelseitig, damit du NICHT durchsehen kannst)
-        for (int i = 0; i < n; i++)
-        {
-            int next = (i + 1) % n;
-
-            int f0 = i;
-            int f1 = next;
-            int b0 = i + n;
-            int b1 = next + n;
-
-            // Seite A
-            tris.Add(f0); tris.Add(f1); tris.Add(b1);
-            tris.Add(f0); tris.Add(b1); tris.Add(b0);
-
-            // Seite A reversed (doppelseitig)
-            tris.Add(b1); tris.Add(f1); tris.Add(f0);
-            tris.Add(b0); tris.Add(b1); tris.Add(f0);
-        }
-
-
-        var mesh = new Mesh();
-        mesh.name = "ArrowSignMesh";
-        mesh.SetVertices(verts);
-        mesh.SetTriangles(tris, 0);
-        mesh.RecalculateNormals();
-        mesh.RecalculateBounds();
-        return mesh;
     }
 
     private void SetProgress(float t)
@@ -805,7 +750,75 @@ public class PeakSigns : BaseUnityPlugin
     }
 
     // =========================
-    // Sign Visual + No Hitbox
+    // Arrow Mesh (mit doppelseitigen Seiten)
+    // =========================
+
+    private static Mesh CreateArrowMesh(float width, float height, float thickness, float tipLength)
+    {
+        float w = width;
+        float h = height;
+        float t = thickness;
+        float tip = Mathf.Clamp(tipLength, 0.05f, w * 0.49f);
+
+        Vector2[] p =
+        {
+            new Vector2(-w * 0.5f, -h * 0.5f),         // 0
+            new Vector2( w * 0.5f - tip, -h * 0.5f),   // 1
+            new Vector2( w * 0.5f, 0f),                // 2 tip
+            new Vector2( w * 0.5f - tip,  h * 0.5f),   // 3
+            new Vector2(-w * 0.5f,  h * 0.5f),         // 4
+        };
+
+        int n = p.Length;
+        var verts = new Vector3[n * 2];
+
+        float zF = +t * 0.5f;
+        float zB = -t * 0.5f;
+
+        for (int i = 0; i < n; i++)
+        {
+            verts[i] = new Vector3(p[i].x, p[i].y, zF);
+            verts[i + n] = new Vector3(p[i].x, p[i].y, zB);
+        }
+
+        var tris = new List<int>(64);
+
+        // Front (CCW)
+        tris.AddRange(new[] { 0, 1, 2,  0, 2, 3,  0, 3, 4 });
+
+        // Back (reverse)
+        tris.AddRange(new[] { n + 0, n + 2, n + 1,  n + 0, n + 3, n + 2,  n + 0, n + 4, n + 3 });
+
+        // Sides (doppelseitig)
+        for (int i = 0; i < n; i++)
+        {
+            int next = (i + 1) % n;
+
+            int f0 = i;
+            int f1 = next;
+            int b0 = i + n;
+            int b1 = next + n;
+
+            // side
+            tris.Add(f0); tris.Add(f1); tris.Add(b1);
+            tris.Add(f0); tris.Add(b1); tris.Add(b0);
+
+            // side reversed
+            tris.Add(b1); tris.Add(f1); tris.Add(f0);
+            tris.Add(b0); tris.Add(b1); tris.Add(f0);
+        }
+
+        var mesh = new Mesh();
+        mesh.name = "ArrowSignMesh";
+        mesh.SetVertices(verts);
+        mesh.SetTriangles(tris, 0);
+        mesh.RecalculateNormals();
+        mesh.RecalculateBounds();
+        return mesh;
+    }
+
+    // =========================
+    // Sign Visual
     // =========================
 
     private GameObject CreateSign(Vector3 groundPos, Quaternion rot, int signId, int ownerActor, Color ownerColor)
@@ -815,24 +828,27 @@ public class PeakSigns : BaseUnityPlugin
         marker.SignId = signId;
         marker.OwnerActor = ownerActor;
 
+        // Panel = Arrow Mesh
         GameObject panel = new GameObject("Panel");
         panel.transform.SetParent(root.transform, false);
         panel.transform.position = groundPos + Vector3.up * 0.9f;
+
+        // 90° gedreht (deine Einstellung)
         panel.transform.rotation = rot * Quaternion.Euler(0f, -90f, 0f);
 
-// Pfeil-Mesh (wie dein Bild, nach rechts zeigend)
         var mf = panel.AddComponent<MeshFilter>();
-        var mr = panel.AddComponent<MeshRenderer>();
+        panel.AddComponent<MeshRenderer>();
 
-// Breite, Höhe, Dicke, Spitzenlänge
+        // Größe hier:
         mf.mesh = CreateArrowMesh(width: 1.2f, height: 0.35f, thickness: 0.08f, tipLength: 0.35f);
 
-// Collider optional (Trigger, blockt nicht)
+        // Collider optional (Trigger)
         var mc = panel.AddComponent<MeshCollider>();
         mc.sharedMesh = mf.mesh;
         mc.convex = true;
         mc.isTrigger = true;
 
+        // Pole
         GameObject pole = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
         pole.name = "Pole";
         pole.transform.SetParent(root.transform, false);
@@ -853,7 +869,7 @@ public class PeakSigns : BaseUnityPlugin
     {
         Collider c = go.GetComponent<Collider>();
         if (c != null) c.isTrigger = true;
-        go.layer = 2;
+        go.layer = 2; // Ignore Raycast
     }
 
     private static void ApplyUnlit(GameObject go, Color c)
