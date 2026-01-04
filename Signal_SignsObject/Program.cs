@@ -21,7 +21,7 @@ public class PeakSigns : BaseUnityPlugin
 
     // Farben
     private readonly Color _deleteColor = new Color(1f, 0.35f, 0.10f, 1f); // orange/rot
-    private readonly Color _placeColor  = new Color(0.20f, 0.80f, 1.00f, 1f); // blau
+    private readonly Color _placeColor  = new Color(0.10f, 1.0f, 0.20f, 1f); // gruen
 
     // -------- Hold-State --------
     private bool _isHolding;
@@ -41,7 +41,7 @@ public class PeakSigns : BaseUnityPlugin
 
     // -------- Photon Events --------
     // Frei wählbare Event-Codes (nur nicht mit Spiel kollidieren; hohe Nummern sind meist ok)
-    private const byte EVT_SPAWN_SIGN  = 201;
+    private const byte EVT_SPAWN_SIGN  = 101;
     private const byte EVT_DELETE_SIGN = 202;
 
     private void Awake()
@@ -469,16 +469,20 @@ public class PeakSigns : BaseUnityPlugin
             _progressRoot.SetActive(visible);
         }
 
-        // Position: links von Mitte
+        // Position: Mitte + kleiner
         RectTransform rt = _progressRoot.GetComponent<RectTransform>();
         if (rt != null)
         {
             rt.anchorMin = new Vector2(0.5f, 0.5f);
             rt.anchorMax = new Vector2(0.5f, 0.5f);
             rt.pivot = new Vector2(0.5f, 0.5f);
-            rt.anchoredPosition = new Vector2(-120f, 0f);
-            rt.localScale = Vector3.one;
+
+            // GENAU MITTE
+            rt.anchoredPosition = new Vector2(180f, 0f);
+            // KLEINER (0.6 - 0.8 ist meist gut)
+            rt.localScale = new Vector3(0.7f, 0.7f, 0.7f);
         }
+
     }
 
     private void SetProgress(float t)
