@@ -10,7 +10,7 @@ using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.UI;
 
-[BepInPlugin("com.mitsch.peaksigns", "Peak Signs", "1.0.0")]
+[BepInPlugin("com.mitschpielen.peaksigns", "Peak Signs", "1.0.0")]
 public class PeakSigns : BaseUnityPlugin
 {
     // -------- Config --------
