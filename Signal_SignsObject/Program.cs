@@ -727,6 +727,69 @@ public class PeakSigns : BaseUnityPlugin
             rt.localScale = new Vector3(0.7f, 0.7f, 0.7f);
         }
     }
+    private static Mesh CreateArrowMesh(float width, float height, float thickness, float tipLength)
+    {
+        float w = width;
+        float h = height;
+        float t = thickness;
+        float tip = Mathf.Clamp(tipLength, 0.05f, w * 0.49f);
+
+        // 2D Pfeil (rechts)
+        // links: Rechteck, rechts: Spitze
+        Vector2[] p =
+        {
+            new Vector2(-w * 0.5f, -h * 0.5f),         // 0 hinten-unten
+            new Vector2( w * 0.5f - tip, -h * 0.5f),   // 1 vorne-unten (vor Spitze)
+            new Vector2( w * 0.5f, 0f),                // 2 Spitze
+            new Vector2( w * 0.5f - tip,  h * 0.5f),   // 3 vorne-oben (vor Spitze)
+            new Vector2(-w * 0.5f,  h * 0.5f),         // 4 hinten-oben
+        };
+
+        // Extrusion entlang Z: vorne (z=+t/2) und hinten (z=-t/2)
+        int n = p.Length;
+        var verts = new Vector3[n * 2];
+
+        float zF = +t * 0.5f;
+        float zB = -t * 0.5f;
+
+        for (int i = 0; i < n; i++)
+        {
+            verts[i] = new Vector3(p[i].x, p[i].y, zF);       // Front
+            verts[i + n] = new Vector3(p[i].x, p[i].y, zB);   // Back
+        }
+
+        // Triangulation für Front (Polygon 0-1-2-3-4)
+        // Front (CCW)
+        var tris = new List<int>();
+
+        // Front face fan um 0: (0,1,2) (0,2,3) (0,3,4)
+        tris.AddRange(new[] { 0, 1, 2,  0, 2, 3,  0, 3, 4 });
+
+        // Back face (reverse winding) mit Offset n
+        tris.AddRange(new[] { n + 0, n + 2, n + 1,  n + 0, n + 3, n + 2,  n + 0, n + 4, n + 3 });
+
+        // Seitenflächen (jede Kante i -> next)
+        for (int i = 0; i < n; i++)
+        {
+            int next = (i + 1) % n;
+
+            int f0 = i;
+            int f1 = next;
+            int b0 = i + n;
+            int b1 = next + n;
+
+            // Zwei Dreiecke pro Quad
+            tris.AddRange(new[] { f0, f1, b1,  f0, b1, b0 });
+        }
+
+        var mesh = new Mesh();
+        mesh.name = "ArrowSignMesh";
+        mesh.SetVertices(verts);
+        mesh.SetTriangles(tris, 0);
+        mesh.RecalculateNormals();
+        mesh.RecalculateBounds();
+        return mesh;
+    }
 
     private void SetProgress(float t)
     {
@@ -746,12 +809,23 @@ public class PeakSigns : BaseUnityPlugin
         marker.SignId = signId;
         marker.OwnerActor = ownerActor;
 
-        GameObject panel = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        panel.name = "Panel";
+        GameObject panel = new GameObject("Panel");
         panel.transform.SetParent(root.transform, false);
         panel.transform.position = groundPos + Vector3.up * 0.9f;
-        panel.transform.rotation = rot;
-        panel.transform.localScale = new Vector3(1.2f, 0.8f, 0.08f);
+        panel.transform.rotation = rot * Quaternion.Euler(0f, -90f, 0f);
+
+// Pfeil-Mesh (wie dein Bild, nach rechts zeigend)
+        var mf = panel.AddComponent<MeshFilter>();
+        var mr = panel.AddComponent<MeshRenderer>();
+
+// Breite, Höhe, Dicke, Spitzenlänge
+        mf.mesh = CreateArrowMesh(width: 1.2f, height: 0.35f, thickness: 0.08f, tipLength: 0.35f);
+
+// Collider optional (Trigger, blockt nicht)
+        var mc = panel.AddComponent<MeshCollider>();
+        mc.sharedMesh = mf.mesh;
+        mc.convex = true;
+        mc.isTrigger = true;
 
         GameObject pole = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
         pole.name = "Pole";
