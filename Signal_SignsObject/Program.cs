@@ -1,103 +1,125 @@
+using System.Collections.Generic;
 using BepInEx;
+using BepInEx.Configuration;
 using UnityEngine;
 using UnityEngine.Rendering;
 
-[BepInPlugin("com.mitsc.signalsignsobject", "Signal Signs Object", "1.0.3")]
-public class SignalSignsObjectPlugin : BaseUnityPlugin
+[BepInPlugin("com.mitsc.peaksigns", "Peak Signs", "0.2.0")]
+public class PeakSigns : BaseUnityPlugin
 {
+    private ConfigEntry<int> _mouseButton;
+    private ConfigEntry<float> _maxDistance;
+    private ConfigEntry<float> _lifetimeSeconds;
+    private ConfigEntry<int> _maxActiveSigns;
+
+    private readonly List<GameObject> _activeSigns = new List<GameObject>();
+
+
     private void Awake()
     {
-        Logger.LogInfo("### SIGNAL SIGNS MOD 1.0.3 GELADEN ###");
+        _mouseButton     = Config.Bind("Input", "MouseButton", 2, "2 = Middle Mouse (Mausrad-Klick)");
+        _maxDistance     = Config.Bind("Placement", "MaxDistance", 60f, "Maximale Platzierungsdistanz (wie Ping-Reichweite).");
+        _lifetimeSeconds = Config.Bind("Placement", "LifetimeSeconds", 20f, "Wie lange das Schild bleibt (Sekunden).");
+        _maxActiveSigns  = Config.Bind("Placement", "MaxActiveSigns", 3, "Maximale Anzahl gleichzeitiger Schilder.");
+
+        Logger.LogInfo("PeakSigns 0.2.0 geladen.");
     }
 
     private void Update()
     {
-        if (Input.GetKeyDown(KeyCode.F))
+        if (Input.GetMouseButtonDown(_mouseButton.Value))
         {
-            Logger.LogInfo("### F GEDRÜCKT -> Spawn() ###");
-            Spawn();
+            TryPlaceSign();
         }
     }
 
-    private void Spawn()
+    private void TryPlaceSign()
     {
-        Logger.LogInfo("### Spawn() START ###");
-
-        Camera cam = Camera.main;
+        var cam = Camera.main;
         if (cam == null)
         {
             Logger.LogError("Camera.main nicht gefunden.");
             return;
         }
 
-        Logger.LogInfo($"### Camera cullingMask: {cam.cullingMask} ###");
+        // Genau wie Ping: Ray aus Bildschirmmitte
+        Ray ray = cam.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0f));
 
-        // 1) Spawn garantiert im Blickfeld: direkt vor der Kamera
-        Vector3 pos = cam.transform.position + cam.transform.forward * 3.0f;
+        if (!Physics.Raycast(ray, out RaycastHit hit, _maxDistance.Value, ~0, QueryTriggerInteraction.Ignore))
+        {
+            Logger.LogInfo("Kein Ziel getroffen (Raycast).");
+            return;
+        }
 
-        // Ein kleines Stück nach unten raycasten, aber NICHT zwingend auf Boden setzen
-        // (damit es nicht im Boden verschwindet)
-        if (Physics.Raycast(pos + Vector3.up * 1.5f, Vector3.down, out RaycastHit hit, 10f, ~0, QueryTriggerInteraction.Ignore))
-            pos = hit.point + Vector3.up * 0.3f;
+        Vector3 pos = hit.point + Vector3.up * 0.05f;
 
-        // 2) Debug-Marker: Kugel (solltest du IMMER sehen)
-        var marker = GameObject.CreatePrimitive(PrimitiveType.Sphere);
-        marker.name = "SignalSign_Marker";
-        marker.transform.position = pos;
-        marker.transform.localScale = Vector3.one * 0.5f;
+        // Schild schaut zur Kamera, aber ohne Neigung
+        Vector3 fwdFlat = Vector3.ProjectOnPlane(cam.transform.forward, Vector3.up).normalized;
+        if (fwdFlat.sqrMagnitude < 0.0001f) fwdFlat = Vector3.forward;
+        Quaternion rot = Quaternion.LookRotation(fwdFlat, Vector3.up);
 
-        var markerMr = marker.GetComponent<MeshRenderer>();
-        markerMr.enabled = true;
-        markerMr.shadowCastingMode = ShadowCastingMode.Off;
-        markerMr.receiveShadows = false;
-        markerMr.material = MakeUnlitColor(Color.magenta);
+        // Limit: alte Schilder entfernen
+        while (_activeSigns.Count >= _maxActiveSigns.Value)
+        {
+            if (_activeSigns[0] != null) Destroy(_activeSigns[0]);
+            _activeSigns.RemoveAt(0);
+        }
 
-        // 3) Das eigentliche "Schild" (absichtlich groß)
-        var sign = GameObject.CreatePrimitive(PrimitiveType.Cube);
-        sign.name = "SignalSign";
-        sign.transform.position = pos + Vector3.up * 0.8f; // über dem Marker
-        sign.transform.rotation = Quaternion.LookRotation(
-            Vector3.ProjectOnPlane(cam.transform.forward, Vector3.up).normalized,
-            Vector3.up
-        );
-        sign.transform.localScale = new Vector3(2.5f, 1.5f, 0.2f); // groß + dick
+        GameObject sign = CreateSign(pos, rot);
 
-        // Rigidbody weg
-        var rb = sign.GetComponent<Rigidbody>();
-        if (rb != null) Destroy(rb);
+        _activeSigns.Add(sign);
+        Destroy(sign, _lifetimeSeconds.Value);
 
-        // 4) Renderer hart erzwingen
-        var mr = sign.GetComponent<MeshRenderer>();
+        Logger.LogInfo($"Schild platziert bei {pos} (entfernt sich in {_lifetimeSeconds.Value}s).");
+    }
+
+    private static GameObject CreateSign(Vector3 groundPos, Quaternion rot)
+    {
+        // Panel
+        var panel = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        panel.name = "PeakSign";
+        panel.transform.position = groundPos + Vector3.up * 0.9f;
+        panel.transform.rotation = rot;
+        panel.transform.localScale = new Vector3(1.2f, 0.8f, 0.08f);
+
+        // Pfosten
+        var pole = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+        pole.name = "PeakSign_Pole";
+        pole.transform.SetParent(panel.transform, worldPositionStays: true);
+        pole.transform.position = groundPos + Vector3.up * 0.45f;
+        pole.transform.rotation = rot;
+        pole.transform.localScale = new Vector3(0.08f, 0.45f, 0.08f);
+
+        // Physik aus
+        var rb1 = panel.GetComponent<Rigidbody>();
+        if (rb1 != null) Object.Destroy(rb1);
+        var rb2 = pole.GetComponent<Rigidbody>();
+        if (rb2 != null) Object.Destroy(rb2);
+
+        // Collider anlassen (damit es "da" ist) oder entfernen:
+        // Object.Destroy(panel.GetComponent<Collider>());
+        // Object.Destroy(pole.GetComponent<Collider>());
+
+        ApplyUnlit(panel, new Color(1f, 0.95f, 0.2f, 1f)); // gelb
+        ApplyUnlit(pole,  new Color(1f, 0.2f, 1f, 1f));   // magenta
+
+        return panel;
+    }
+
+    private static void ApplyUnlit(GameObject go, Color c)
+    {
+        var mr = go.GetComponent<MeshRenderer>();
+        if (mr == null) return;
+
         mr.enabled = true;
         mr.shadowCastingMode = ShadowCastingMode.On;
         mr.receiveShadows = true;
 
-        // 5) UNLIT Material erzwingen (damit es niemals "transparent" wird)
-        mr.material = MakeUnlitColor(Color.yellow);
-
-        Logger.LogInfo($"### Spawned at {pos} ###");
-        Logger.LogInfo($"### Sign renderer enabled={mr.enabled}, shadowCastingMode={mr.shadowCastingMode} ###");
-    }
-
-    private static Material MakeUnlitColor(Color c)
-    {
-        // Erst versuchen: Built-in Unlit/Color
-        Shader s = Shader.Find("Unlit/Color");
-
-        // Falls Spiel eigene Unlit Shader hat, bleibt das oft null.
-        // Dann fallback auf Standard, aber RenderQueue hochziehen.
-        if (s == null)
-            s = Shader.Find("Standard");
-
+        Shader s = Shader.Find("Unlit/Color") ?? Shader.Find("Standard");
         var m = new Material(s);
+        if (m.HasProperty("_Color")) m.color = c;
+        m.renderQueue = 3000;
 
-        // Viele Shader nutzen _Color
-        if (m.HasProperty("_Color"))
-            m.color = c;
-
-        // Sicherstellen, dass es nicht "hinter" irgendwas gerendert wird
-        m.renderQueue = 3000; // transparent queue-ish, oft sichtbar
-
-        return m;
+        mr.material = m;
     }
 }
