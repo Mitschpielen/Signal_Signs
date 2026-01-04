@@ -2,59 +2,81 @@ using System;
 using System.Collections.Generic;
 using BepInEx;
 using BepInEx.Configuration;
+using ExitGames.Client.Photon;
+using Photon.Pun;
+using Photon.Realtime;
 using UnityEngine;
-using UnityEngine.UI;
 using UnityEngine.Rendering;
+using UnityEngine.UI;
 
-[BepInPlugin("com.mitsc.peaksigns", "Peak Signs", "0.8.1")]
+[BepInPlugin("com.mitsc.peaksigns", "Peak Signs", "1.0.0")]
 public class PeakSigns : BaseUnityPlugin
 {
+    // -------- Config --------
     private ConfigEntry<int> _mouseButton;
     private ConfigEntry<float> _maxDistance;
+
     private ConfigEntry<float> _deleteHoldSeconds;
+    private ConfigEntry<float> _placeHoldSeconds;
 
-    // Farbe für den Lösch-Progress (kannst du anpassen)
-    // Beispiel: rot/orange
-    private readonly Color _deleteColor = new Color(1f, 0.35f, 0.10f, 1f);
+    // Farben
+    private readonly Color _deleteColor = new Color(1f, 0.35f, 0.10f, 1f); // orange/rot
+    private readonly Color _placeColor  = new Color(0.20f, 0.80f, 1.00f, 1f); // blau
 
-    // Hold-State (MMB)
+    // -------- Hold-State --------
     private bool _isHolding;
     private float _holdStart;
+    private bool _placedThisHold;
+
+    // Target fürs Löschen (kann während Hold wechseln)
     private GameObject _deleteTarget;
 
-    // Schilder
-    private readonly List<GameObject> _signs = new List<GameObject>();
+    // -------- Signs (lokal + MP) --------
+    private readonly Dictionary<int, GameObject> _signsById = new Dictionary<int, GameObject>();
 
-    // Progress UI (gezielt aus UseItem geklont)
+    // -------- Progress UI (UseItem Clone) --------
     private GameObject _progressRoot;
     private Image _progressFill;
     private bool _progressReady;
 
-    // Originalfarbe merken (damit wir optional wieder zurücksetzen können)
-    private Color _originalProgressColor;
+    // -------- Photon Events --------
+    // Frei wählbare Event-Codes (nur nicht mit Spiel kollidieren; hohe Nummern sind meist ok)
+    private const byte EVT_SPAWN_SIGN  = 201;
+    private const byte EVT_DELETE_SIGN = 202;
 
     private void Awake()
     {
         _mouseButton = Config.Bind("Input", "MouseButton", 2, "2 = Middle Mouse (Mausrad-Klick)");
         _maxDistance = Config.Bind("Placement", "MaxDistance", 60f, "Maximale Distanz.");
-        _deleteHoldSeconds = Config.Bind("Delete", "HoldSeconds", 1.25f, "Hold-Zeit zum Löschen.");
 
-        Logger.LogInfo("Peak Signs 0.8.1 geladen. Progress-Kreis aus 'UseItem' + Farbe angepasst.");
+        _deleteHoldSeconds = Config.Bind("Delete", "HoldSeconds", 1.25f, "Hold-Zeit zum Löschen.");
+        _placeHoldSeconds  = Config.Bind("Placement", "HoldSeconds", 1.00f, "Hold-Zeit zum Platzieren.");
+
+        Logger.LogInfo("Peak Signs 1.0.0 geladen. Place+Delete mit Progress + Multiplayer Sync (Photon).");
+    }
+
+    private void OnEnable()
+    {
+        // Photon Event Hook
+        if (PhotonNetwork.NetworkingClient != null)
+            PhotonNetwork.NetworkingClient.EventReceived += OnPhotonEvent;
+    }
+
+    private void OnDisable()
+    {
+        if (PhotonNetwork.NetworkingClient != null)
+            PhotonNetwork.NetworkingClient.EventReceived -= OnPhotonEvent;
     }
 
     private void Start()
     {
-        // Versuch beim Start – falls HUD später lädt, versuchen wir auch in Update nochmal.
         TrySetupUseItemProgress();
     }
 
     private void Update()
     {
         if (!_progressReady)
-        {
-            // HUD kann nachladen → gelegentlich nochmal versuchen
             TrySetupUseItemProgress();
-        }
 
         int btn = _mouseButton.Value;
 
@@ -62,54 +84,246 @@ public class PeakSigns : BaseUnityPlugin
         {
             _isHolding = true;
             _holdStart = Time.unscaledTime;
+            _placedThisHold = false;
+
+            // initial check
             _deleteTarget = GetSignUnderCrosshair();
         }
 
         if (_isHolding && Input.GetMouseButton(btn))
         {
+            float held = Time.unscaledTime - _holdStart;
+
+            // Während Hold: wenn wir noch nicht platziert haben, darf sich Target ändern
+            // (z.B. du fängst frei an zu halten, zielst dann auf Schild -> soll löschen)
+            if (!_placedThisHold)
+                _deleteTarget = GetSignUnderCrosshair();
+
+            // FALL A: Auf Schild -> Löschen-Progress
             if (_deleteTarget != null)
             {
-                float held = Time.unscaledTime - _holdStart;
-                float t = Mathf.Clamp01(held / Mathf.Max(0.01f, _deleteHoldSeconds.Value));
-
-                ShowProgress(true);
-                SetProgress(t);
+                float tDelete = Mathf.Clamp01(held / Mathf.Max(0.01f, _deleteHoldSeconds.Value));
+                ShowProgress(true, _deleteColor);
+                SetProgress(tDelete);
 
                 if (held >= _deleteHoldSeconds.Value)
                 {
-                    DeleteSign(_deleteTarget);
+                    // Schild-ID finden (Root hat Marker, wir speichern IDs in Dictionary -> suchen)
+                    int id = FindIdForSignObject(_deleteTarget);
+                    if (id != 0)
+                        RequestDelete(id);
+
                     _deleteTarget = null;
                     _isHolding = false;
-                    ShowProgress(false);
+                    ShowProgress(false, _deleteColor);
                 }
+
+                return;
             }
-            else
+
+            // FALL B: Nicht auf Schild -> Platzieren nach Hold-Zeit mit Progress
+            float tPlace = Mathf.Clamp01(held / Mathf.Max(0.01f, _placeHoldSeconds.Value));
+            ShowProgress(true, _placeColor);
+            SetProgress(tPlace);
+
+            if (!_placedThisHold && held >= _placeHoldSeconds.Value)
             {
-                ShowProgress(false);
+                // Spawn an visiertem Punkt
+                if (TryGetPlacement(out Vector3 pos, out Quaternion rot))
+                {
+                    int id = GenerateSignId();
+                    RequestSpawn(id, pos, rot);
+                    _placedThisHold = true;
+                }
+                // Nach Platzierung: Progress aus (oder lass ihn kurz stehen, wenn du willst)
+                ShowProgress(false, _placeColor);
             }
         }
 
         if (_isHolding && Input.GetMouseButtonUp(btn))
         {
-            float held = Time.unscaledTime - _holdStart;
-
-            // Kurzer Klick: wenn nicht auf Schild gezielt -> Schild platzieren
-            if (_deleteTarget == null && held < _deleteHoldSeconds.Value)
-                TryPlaceSign();
-
-            _deleteTarget = null;
             _isHolding = false;
-            ShowProgress(false);
+            _deleteTarget = null;
+            ShowProgress(false, _deleteColor);
+            ShowProgress(false, _placeColor);
         }
     }
 
-    // -------------------- Progress UI: UseItem -> Filled Radial Kreis --------------------
+    // =========================
+    // Multiplayer Requests
+    // =========================
+
+    private void RequestSpawn(int id, Vector3 pos, Quaternion rot)
+    {
+        // Lokal spawnen
+        SpawnLocal(id, pos, rot);
+
+        // Multiplayer: an andere schicken
+        if (IsInMultiplayerRoom())
+        {
+            object[] data = new object[]
+            {
+                id,
+                pos.x, pos.y, pos.z,
+                rot.x, rot.y, rot.z, rot.w
+            };
+
+            var opts = new RaiseEventOptions { Receivers = ReceiverGroup.Others };
+            PhotonNetwork.RaiseEvent(EVT_SPAWN_SIGN, data, opts, SendOptions.SendReliable);
+        }
+    }
+
+    private void RequestDelete(int id)
+    {
+        // Lokal löschen
+        DeleteLocal(id);
+
+        // Multiplayer: an andere schicken
+        if (IsInMultiplayerRoom())
+        {
+            object[] data = new object[] { id };
+            var opts = new RaiseEventOptions { Receivers = ReceiverGroup.Others };
+            PhotonNetwork.RaiseEvent(EVT_DELETE_SIGN, data, opts, SendOptions.SendReliable);
+        }
+    }
+
+    private void OnPhotonEvent(EventData photonEvent)
+    {
+        if (photonEvent == null) return;
+
+        if (photonEvent.Code == EVT_SPAWN_SIGN)
+        {
+            object[] data = photonEvent.CustomData as object[];
+            if (data == null || data.Length < 8) return;
+
+            int id = (int)data[0];
+
+            float px = Convert.ToSingle(data[1]);
+            float py = Convert.ToSingle(data[2]);
+            float pz = Convert.ToSingle(data[3]);
+
+            float qx = Convert.ToSingle(data[4]);
+            float qy = Convert.ToSingle(data[5]);
+            float qz = Convert.ToSingle(data[6]);
+            float qw = Convert.ToSingle(data[7]);
+
+            SpawnLocal(id, new Vector3(px, py, pz), new Quaternion(qx, qy, qz, qw));
+        }
+        else if (photonEvent.Code == EVT_DELETE_SIGN)
+        {
+            object[] data = photonEvent.CustomData as object[];
+            if (data == null || data.Length < 1) return;
+
+            int id = (int)data[0];
+            DeleteLocal(id);
+        }
+    }
+
+    private bool IsInMultiplayerRoom()
+    {
+        // "InRoom" deckt i.d.R. Multiplayer ab
+        return PhotonNetwork.IsConnected && PhotonNetwork.InRoom;
+    }
+
+    // =========================
+    // Spawn/Delete Local
+    // =========================
+
+    private void SpawnLocal(int id, Vector3 groundPos, Quaternion rot)
+    {
+        if (_signsById.ContainsKey(id))
+            return; // schon da
+
+        GameObject sign = CreateSign(groundPos, rot);
+        _signsById[id] = sign;
+
+        Logger.LogInfo($"Schild gespawnt id={id} pos={groundPos}");
+    }
+
+    private void DeleteLocal(int id)
+    {
+        if (!_signsById.TryGetValue(id, out GameObject sign) || sign == null)
+            return;
+
+        _signsById.Remove(id);
+        Destroy(sign);
+
+        Logger.LogInfo($"Schild gelöscht id={id}");
+    }
+
+    private int FindIdForSignObject(GameObject signObj)
+    {
+        // signObj ist unser Root (PeakSign), oder Child -> wir gehen auf Marker-Root
+        PeakSignMarker marker = signObj.GetComponent<PeakSignMarker>();
+        if (marker == null) marker = signObj.GetComponentInParent<PeakSignMarker>();
+        GameObject root = marker != null ? marker.gameObject : signObj;
+
+        foreach (var kv in _signsById)
+        {
+            if (kv.Value == root)
+                return kv.Key;
+        }
+        return 0;
+    }
+
+    private int GenerateSignId()
+    {
+        // einfache ID; robust genug für kleine Mods
+        int id;
+        do
+        {
+            id = UnityEngine.Random.Range(100000, int.MaxValue);
+        } while (_signsById.ContainsKey(id));
+        return id;
+    }
+
+    // =========================
+    // Placement Raycast (Ping-Style)
+    // =========================
+
+    private bool TryGetPlacement(out Vector3 groundPos, out Quaternion rot)
+    {
+        groundPos = Vector3.zero;
+        rot = Quaternion.identity;
+
+        Camera cam = Camera.main;
+        if (cam == null) return false;
+
+        Ray ray = cam.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0f));
+        if (!Physics.Raycast(ray, out RaycastHit hit, _maxDistance.Value, ~0, QueryTriggerInteraction.Ignore))
+            return false;
+
+        groundPos = hit.point + Vector3.up * 0.05f;
+
+        Vector3 fwdFlat = Vector3.ProjectOnPlane(cam.transform.forward, Vector3.up);
+        if (fwdFlat.sqrMagnitude < 0.0001f) fwdFlat = Vector3.forward;
+
+        rot = Quaternion.LookRotation(fwdFlat.normalized, Vector3.up);
+        return true;
+    }
+
+    private GameObject GetSignUnderCrosshair()
+    {
+        Camera cam = Camera.main;
+        if (cam == null) return null;
+
+        Ray ray = cam.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0f));
+        if (Physics.Raycast(ray, out RaycastHit hit, _maxDistance.Value, ~0, QueryTriggerInteraction.Collide))
+        {
+            PeakSignMarker marker = hit.collider != null ? hit.collider.GetComponentInParent<PeakSignMarker>() : null;
+            if (marker != null) return marker.gameObject;
+        }
+        return null;
+    }
+
+    // =========================
+    // Progress UI (UseItem Clone)
+    // =========================
 
     private void TrySetupUseItemProgress()
     {
         if (_progressReady) return;
 
-        // 1) Finde GameObject namens "UseItem"
         GameObject[] all = Resources.FindObjectsOfTypeAll<GameObject>();
         GameObject useItem = null;
 
@@ -119,7 +333,7 @@ public class PeakSigns : BaseUnityPlugin
             if (go == null) continue;
             if (!string.Equals(go.name, "UseItem", StringComparison.OrdinalIgnoreCase)) continue;
 
-            // optional: bevorzugt aus "GAME" root (wie bei dir im Pfad)
+            // bevorzugt "GAME" root, falls vorhanden
             if (go.transform.root != null &&
                 go.transform.root.name.IndexOf("GAME", StringComparison.OrdinalIgnoreCase) >= 0)
             {
@@ -132,7 +346,6 @@ public class PeakSigns : BaseUnityPlugin
 
         if (useItem == null) return;
 
-        // 2) In UseItem: Filled Image mit Radial fill suchen (dein Kreis)
         Image[] imgs = useItem.GetComponentsInChildren<Image>(true);
         Image best = null;
 
@@ -155,7 +368,6 @@ public class PeakSigns : BaseUnityPlugin
 
         if (best == null) return;
 
-        // 3) Parent-Container klonen (max 3 Ebenen hoch, aber nicht den ganzen HUD)
         Transform root = best.transform;
         for (int up = 0; up < 3 && root.parent != null; up++)
         {
@@ -171,35 +383,23 @@ public class PeakSigns : BaseUnityPlugin
         }
 
         _progressRoot = Instantiate(root.gameObject, root.parent);
-        _progressRoot.name = "PeakSigns_DeleteProgress(UseItemClone)";
+        _progressRoot.name = "PeakSigns_Progress(Clone)";
         _progressRoot.SetActive(true);
 
-        // 4) Animator/Animation entfernen, weil sie oft Sichtbarkeit steuern
         StripAnimators(_progressRoot);
-
-        // 5) CanvasGroup erzwingen und von uns steuern
         EnsureCanvasGroups(_progressRoot);
 
-        // 6) Passendes Filled Image im Clone finden (Name+FillMethod)
         _progressFill = FindFillInClone(_progressRoot, best.name, best.fillMethod);
 
-        // Farbe setzen (Original merken)
-        if (_progressFill != null)
-        {
-            _originalProgressColor = _progressFill.color;
-            _progressFill.color = _deleteColor;
-        }
-
-        // Startzustand
         SetProgress(0f);
-        ShowProgress(false);
+        ShowProgress(false, _deleteColor);
 
         _progressReady = (_progressFill != null);
 
-        Logger.LogInfo("✅ UseItem-Kreis bereit: root=" + root.name +
+        Logger.LogInfo("✅ Progress UI bereit (UseItem): root=" + root.name +
                        " | fillName=" + best.name +
                        " | fillMethod=" + best.fillMethod +
-                       " | cloneFillFound=" + (_progressFill != null));
+                       " | ok=" + _progressReady);
     }
 
     private static void StripAnimators(GameObject root)
@@ -224,7 +424,6 @@ public class PeakSigns : BaseUnityPlugin
     {
         Image[] imgs = cloneRoot.GetComponentsInChildren<Image>(true);
 
-        // exakter Treffer
         for (int i = 0; i < imgs.Length; i++)
         {
             Image im = imgs[i];
@@ -234,7 +433,6 @@ public class PeakSigns : BaseUnityPlugin
                 return im;
         }
 
-        // fallback: erstes Filled
         for (int i = 0; i < imgs.Length; i++)
         {
             Image im = imgs[i];
@@ -245,18 +443,15 @@ public class PeakSigns : BaseUnityPlugin
         return null;
     }
 
-    private void ShowProgress(bool visible)
+    private void ShowProgress(bool visible, Color color)
     {
         if (_progressRoot == null) return;
 
-        // Nach vorne
         _progressRoot.transform.SetAsLastSibling();
 
-        // Optional: beim Einblenden sicherstellen, dass die Wunschfarbe gesetzt ist
         if (_progressFill != null)
-            _progressFill.color = _deleteColor;
+            _progressFill.color = color;
 
-        // Sichtbarkeit über CanvasGroup Alpha erzwingen
         CanvasGroup[] groups = _progressRoot.GetComponentsInChildren<CanvasGroup>(true);
         if (groups != null && groups.Length > 0)
         {
@@ -274,7 +469,7 @@ public class PeakSigns : BaseUnityPlugin
             _progressRoot.SetActive(visible);
         }
 
-        // Position: links von Mitte (wie beschrieben)
+        // Position: links von Mitte
         RectTransform rt = _progressRoot.GetComponent<RectTransform>();
         if (rt != null)
         {
@@ -293,62 +488,15 @@ public class PeakSigns : BaseUnityPlugin
         _progressFill.fillAmount = Mathf.Clamp01(t);
     }
 
-    // --------------------- Signs: place / pick / delete ---------------------
-
-    private void TryPlaceSign()
-    {
-        Camera cam = Camera.main;
-        if (cam == null) return;
-
-        Ray ray = cam.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0f));
-        RaycastHit hit;
-
-        if (!Physics.Raycast(ray, out hit, _maxDistance.Value, ~0, QueryTriggerInteraction.Ignore))
-            return;
-
-        Vector3 groundPos = hit.point + Vector3.up * 0.05f;
-
-        Vector3 fwdFlat = Vector3.ProjectOnPlane(cam.transform.forward, Vector3.up);
-        if (fwdFlat.sqrMagnitude < 0.0001f) fwdFlat = Vector3.forward;
-
-        GameObject sign = CreateSign(groundPos, Quaternion.LookRotation(fwdFlat.normalized, Vector3.up));
-        _signs.Add(sign);
-
-        Logger.LogInfo("Schild platziert (MMB kurz). Löschen: MMB halten auf Schild.");
-    }
-
-    private GameObject GetSignUnderCrosshair()
-    {
-        Camera cam = Camera.main;
-        if (cam == null) return null;
-
-        Ray ray = cam.ViewportPointToRay(new Vector3(0.5f, 0.5f, 0f));
-        RaycastHit hit;
-
-        // Trigger sollen getroffen werden (keine Hitbox, aber auswählbar)
-        if (Physics.Raycast(ray, out hit, _maxDistance.Value, ~0, QueryTriggerInteraction.Collide))
-        {
-            PeakSignMarker marker = (hit.collider != null) ? hit.collider.GetComponentInParent<PeakSignMarker>() : null;
-            if (marker != null) return marker.gameObject;
-        }
-
-        return null;
-    }
-
-    private void DeleteSign(GameObject sign)
-    {
-        if (sign == null) return;
-        _signs.Remove(sign);
-        Destroy(sign);
-        Logger.LogInfo("Schild gelöscht.");
-    }
+    // =========================
+    // Sign Visual + No Hitbox
+    // =========================
 
     private GameObject CreateSign(Vector3 groundPos, Quaternion rot)
     {
         GameObject root = new GameObject("PeakSign");
         root.AddComponent<PeakSignMarker>();
 
-        // Panel
         GameObject panel = GameObject.CreatePrimitive(PrimitiveType.Cube);
         panel.name = "Panel";
         panel.transform.SetParent(root.transform, false);
@@ -356,7 +504,6 @@ public class PeakSigns : BaseUnityPlugin
         panel.transform.rotation = rot;
         panel.transform.localScale = new Vector3(1.2f, 0.8f, 0.08f);
 
-        // Pfosten
         GameObject pole = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
         pole.name = "Pole";
         pole.transform.SetParent(root.transform, false);
@@ -364,11 +511,9 @@ public class PeakSigns : BaseUnityPlugin
         pole.transform.rotation = rot;
         pole.transform.localScale = new Vector3(0.08f, 0.45f, 0.08f);
 
-        // Keine Hitbox: blockt nicht (Trigger)
         MakeNoHitbox(panel);
         MakeNoHitbox(pole);
 
-        // Sichtbar
         ApplyUnlit(panel, new Color(1f, 0.95f, 0.2f, 1f));
         ApplyUnlit(pole, new Color(1f, 0.2f, 1f, 1f));
 
@@ -401,5 +546,4 @@ public class PeakSigns : BaseUnityPlugin
     }
 }
 
-// Marker damit wir Schilder in Raycasts erkennen
 public class PeakSignMarker : MonoBehaviour { }
