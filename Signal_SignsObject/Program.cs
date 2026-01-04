@@ -768,7 +768,7 @@ public class PeakSigns : BaseUnityPlugin
         // Back face (reverse winding) mit Offset n
         tris.AddRange(new[] { n + 0, n + 2, n + 1,  n + 0, n + 3, n + 2,  n + 0, n + 4, n + 3 });
 
-        // Seitenflächen (jede Kante i -> next)
+        // Seitenflächen (doppelseitig, damit du NICHT durchsehen kannst)
         for (int i = 0; i < n; i++)
         {
             int next = (i + 1) % n;
@@ -778,9 +778,15 @@ public class PeakSigns : BaseUnityPlugin
             int b0 = i + n;
             int b1 = next + n;
 
-            // Zwei Dreiecke pro Quad
-            tris.AddRange(new[] { f0, f1, b1,  f0, b1, b0 });
+            // Seite A
+            tris.Add(f0); tris.Add(f1); tris.Add(b1);
+            tris.Add(f0); tris.Add(b1); tris.Add(b0);
+
+            // Seite A reversed (doppelseitig)
+            tris.Add(b1); tris.Add(f1); tris.Add(f0);
+            tris.Add(b0); tris.Add(b1); tris.Add(f0);
         }
+
 
         var mesh = new Mesh();
         mesh.name = "ArrowSignMesh";
