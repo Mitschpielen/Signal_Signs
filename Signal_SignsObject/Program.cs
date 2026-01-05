@@ -1026,14 +1026,14 @@ public class PeakSigns : BaseUnityPlugin
         ApplyUnlit(panel, ownerColor);
         ApplyUnlit(pole, Color.Lerp(ownerColor, Color.black, 0.45f));
 
-        // --- Player name label (world-space UI, depth-tested, both sides) ---
+        // --- Player name label (TextMesh, depth-tested, both sides, auto-fit) ---
         try
         {
             string playerName = GetOwnerPlayerName(ownerActor);
-            Material uiMat = CreateDepthTestedUiMaterial();
+            Material textMat = CreateDepthTestedTextMaterial();
 
-            CreateNameLabelWorldUI(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness, isBackSide: false, uiMat: uiMat);
-            CreateNameLabelWorldUI(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness, isBackSide: true, uiMat: uiMat);
+            CreateNameLabelTextMesh(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness, isBackSide: false, textMat: textMat);
+            CreateNameLabelTextMesh(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness, isBackSide: true,  textMat: textMat);
         }
         catch (Exception e)
         {
@@ -1094,7 +1094,27 @@ public class PeakSigns : BaseUnityPlugin
         return m;
     }
 
-    private static void CreateNameLabelWorldUI(
+    private static Material CreateDepthTestedTextMaterial()
+    {
+        // Hidden/Internal-TextMeshPro is a fallback for TextMeshPro text objects.
+        Shader s = Shader.Find("Hidden/Internal-TextMeshPro");
+        if (s == null)
+            s = Shader.Find("Sprites/Default");
+        if (s == null)
+            return null;
+
+        var m = new Material(s);
+
+        // Force depth test/write when supported by the shader.
+        if (m.HasProperty("_ZWrite")) m.SetFloat("_ZWrite", 1f);
+        if (m.HasProperty("_ZTest")) m.SetFloat("_ZTest", (float)CompareFunction.LessEqual);
+
+        // Keep in transparent range but depth-tested.
+        m.renderQueue = 3000;
+        return m;
+    }
+
+    private static void CreateNameLabelTextMesh(
         Transform panel,
         string text,
         float panelWidth,
@@ -1102,82 +1122,34 @@ public class PeakSigns : BaseUnityPlugin
         float tipLen,
         float panelThickness,
         bool isBackSide,
-        Material uiMat)
+        Material textMat)
     {
-        // Build a small world-space canvas stuck to the panel face.
-        var canvasGo = new GameObject(isBackSide ? "NameCanvasBack" : "NameCanvasFront");
-        canvasGo.transform.SetParent(panel, false);
+        // Build a TextMesh object as a child of the panel.
+        var textGo = new GameObject("NameLabel");
+        textGo.transform.SetParent(panel, false);
 
-        var canvas = canvasGo.AddComponent<Canvas>();
-        canvas.renderMode = RenderMode.WorldSpace;
-        canvas.worldCamera = Camera.main;
+        var textMesh = textGo.AddComponent<TextMesh>();
+        textMesh.text = text;
+        textMesh.color = Color.black;
+        textMesh.anchor = TextAnchor.MiddleCenter;
+        textMesh.alignment = TextAlignment.Center;
+        textMesh.fontSize = 0.08f;
+        textMesh.richText = true;
 
-        // Make it deterministic and lightweight
-        canvasGo.AddComponent<CanvasScaler>();
-        canvasGo.AddComponent<GraphicRaycaster>();
-
-        // Place it on the face.
-        float z = (panelThickness * 0.5f) + 0.01f;
-        if (isBackSide)
-        {
-            canvasGo.transform.localPosition = new Vector3(-tipLen * 0.25f, 0f, -z);
-            // Rotate canvas to face outward from the back.
-            canvasGo.transform.localRotation = Quaternion.Euler(0f, 180f, 0f);
-        }
-        else
-        {
-            canvasGo.transform.localPosition = new Vector3(-tipLen * 0.25f, 0f, +z);
-            canvasGo.transform.localRotation = Quaternion.identity;
-        }
-
-        // Rect size (in UI units). We'll map 100 units = 1 world unit for easy math.
-        const float unitsPerWorld = 100f;
-
-        float padX = 0.12f;
-        float padY = 0.06f;
-        float usableWidthWorld = Mathf.Max(0.05f, panelWidth - tipLen - padX);
-        float usableHeightWorld = Mathf.Max(0.05f, panelHeight - padY);
-
-        var rt = canvas.GetComponent<RectTransform>();
-        rt.sizeDelta = new Vector2(usableWidthWorld * unitsPerWorld, usableHeightWorld * unitsPerWorld);
-        rt.localScale = Vector3.one / unitsPerWorld;
-
-        // Child Text
-        var textGo = new GameObject("Text");
-        textGo.transform.SetParent(canvasGo.transform, false);
-
-        var textRt = textGo.AddComponent<RectTransform>();
-        textRt.anchorMin = Vector2.zero;
-        textRt.anchorMax = Vector2.one;
-        textRt.offsetMin = Vector2.zero;
-        textRt.offsetMax = Vector2.zero;
-
-        var uiText = textGo.AddComponent<Text>();
-        uiText.text = text;
-        uiText.color = Color.black;
-        uiText.alignment = TextAnchor.MiddleCenter;
-        uiText.horizontalOverflow = HorizontalWrapMode.Overflow;
-        uiText.verticalOverflow = VerticalWrapMode.Overflow;
-
-        // Counteract mirroring that can happen with WorldSpace canvases on the back side.
-        // Keep the canvas facing the back, but flip the text content so glyphs read normally.
+        // Counteract mirroring that can happen with TextMesh on the back side.
         if (isBackSide)
             textGo.transform.localScale = new Vector3(-1f, 1f, 1f);
 
-        uiText.font = GetBuiltinArialFont();
-        uiText.fontStyle = FontStyle.Bold;
+        textMesh.font = GetBuiltinArialFont();
+        textMesh.fontStyle = FontStyle.Bold;
 
         // BestFit shrinks to keep within rect
-        uiText.resizeTextForBestFit = true;
-        uiText.resizeTextMinSize = 8;
-        uiText.resizeTextMaxSize = 48;
-
-        // Apply material if provided (depth-tested)
-        if (uiMat != null)
-            uiText.material = uiMat;
+        textMesh.GetComponent<Renderer>().material = textMat;
+        textMesh.GetComponent<Renderer>().shadowCastingMode = ShadowCastingMode.Off;
+        textMesh.GetComponent<Renderer>().receiveShadows = false;
 
         // Disable raycast so it doesn't interfere
-        uiText.raycastTarget = false;
+        textMesh.GetComponent<Collider>().enabled = false;
     }
 }
 
