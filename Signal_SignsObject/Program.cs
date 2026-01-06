@@ -513,6 +513,123 @@ public class PeakSigns : BaseUnityPlugin
         catch { return fallback; }
     }
 
+    private static string GetOwnerPlayerName(int ownerActor)
+    {
+        try
+        {
+            if (!PhotonNetwork.IsConnected || PhotonNetwork.CurrentRoom == null)
+                return "Player";
+
+            Photon.Realtime.Player p = PhotonNetwork.CurrentRoom.GetPlayer(ownerActor);
+            if (p == null || string.IsNullOrWhiteSpace(p.NickName))
+                return "Player";
+
+            return p.NickName;
+        }
+        catch
+        {
+            return "Player";
+        }
+    }
+
+    private static void AdjustTextSizeForName(TextMesh textMesh, string name)
+    {
+        // Legacy heuristic kept for compatibility; CreateSign now uses FitTextMeshToPanelBounds.
+        if (textMesh == null) return;
+
+        if (string.IsNullOrEmpty(name))
+        {
+            textMesh.characterSize = 0.08f;
+            return;
+        }
+
+        int len = name.Length;
+
+        const int maxComfortableChars = 10;  // looks good at base size
+        const int hardMaxChars = 25;         // very long names
+
+        float baseSize = 0.08f;
+        float minSize = 0.035f;
+
+        if (len <= maxComfortableChars)
+        {
+            textMesh.characterSize = baseSize;
+            return;
+        }
+
+        float t = Mathf.InverseLerp(maxComfortableChars, hardMaxChars, len);
+        float scaled = Mathf.Lerp(baseSize, minSize, t);
+        textMesh.characterSize = scaled;
+    }
+
+    private static void FitTextMeshToPanelBounds(TextMesh textMesh, float maxWidth, float maxHeight, float baseCharacterSize, float minCharacterSize)
+    {
+        if (textMesh == null) return;
+
+        var mr = textMesh.GetComponent<MeshRenderer>();
+        if (mr == null) return;
+
+        // Ensure renderer is on so bounds are valid.
+        mr.enabled = true;
+
+        string original = textMesh.text ?? string.Empty;
+        if (original.Length == 0)
+        {
+            textMesh.characterSize = baseCharacterSize;
+            return;
+        }
+
+        // 1) Shrink to fit (fast, robust).
+        textMesh.characterSize = baseCharacterSize;
+
+        // Avoid infinite loops if bounds are weird.
+        for (int i = 0; i < 20; i++)
+        {
+            Bounds b = mr.bounds;
+            float w = b.size.x;
+            float h = b.size.y;
+
+            // If bounds are degenerate, bail.
+            if (w <= 0.0001f || h <= 0.0001f)
+                break;
+
+            if (w <= maxWidth && h <= maxHeight)
+                return;
+
+            // Scale down proportionally by worst overflow.
+            float scaleW = maxWidth / w;
+            float scaleH = maxHeight / h;
+            float scale = Mathf.Min(scaleW, scaleH);
+
+            // In case we barely overflow, nudge a bit.
+            scale = Mathf.Clamp(scale, 0.75f, 0.98f);
+            float next = textMesh.characterSize * scale;
+
+            if (next >= textMesh.characterSize - 0.00001f)
+                next = textMesh.characterSize - 0.002f;
+
+            textMesh.characterSize = Mathf.Max(minCharacterSize, next);
+
+            if (textMesh.characterSize <= minCharacterSize + 0.00001f)
+                break;
+        }
+
+        // 2) Still not fitting at min size -> ellipsis to fit width.
+        for (int cut = original.Length; cut >= 1; cut--)
+        {
+            Bounds b = mr.bounds;
+            if (b.size.x <= maxWidth && b.size.y <= maxHeight)
+                return;
+
+            // Keep at least 1 char + …
+            int keep = Mathf.Max(1, cut - 1);
+            textMesh.text = original.Substring(0, keep) + "…";
+        }
+
+        // If nothing fits (shouldn't happen), keep a single dot.
+        textMesh.text = "…";
+    }
+
     private static object GetMemberValue(object obj, string name)
     {
         if (obj == null) return null;
@@ -909,6 +1026,20 @@ public class PeakSigns : BaseUnityPlugin
         ApplyUnlit(panel, ownerColor);
         ApplyUnlit(pole, Color.Lerp(ownerColor, Color.black, 0.45f));
 
+        // --- Player name label (TextMesh, depth-tested, both sides, auto-fit) ---
+        try
+        {
+            string playerName = GetOwnerPlayerName(ownerActor);
+            Material textMat = CreateDepthTestedTextMaterial();
+
+            CreateNameLabelTextMesh(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness, isBackSide: false, textMat: textMat);
+            CreateNameLabelTextMesh(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness, isBackSide: true,  textMat: textMat);
+        }
+        catch (Exception e)
+        {
+            Logger.LogWarning($"Failed to create sign label: {e}");
+        }
+
         return root;
     }
 
@@ -935,6 +1066,90 @@ public class PeakSigns : BaseUnityPlugin
         mr.enabled = true;
         mr.shadowCastingMode = ShadowCastingMode.On;
         mr.receiveShadows = true;
+    }
+
+    private static Font GetBuiltinArialFont()
+    {
+        // Built-in resource name in Unity
+        return Resources.GetBuiltinResource<Font>("Arial.ttf");
+    }
+
+    private static Material CreateDepthTestedUiMaterial()
+    {
+        // UI/Default is the standard for Unity UI Text and supports alpha.
+        Shader s = Shader.Find("UI/Default");
+        if (s == null)
+            s = Shader.Find("Sprites/Default");
+        if (s == null)
+            return null;
+
+        var m = new Material(s);
+
+        // Force depth test/write when supported by the shader.
+        if (m.HasProperty("_ZWrite")) m.SetFloat("_ZWrite", 1f);
+        if (m.HasProperty("_ZTest")) m.SetFloat("_ZTest", (float)CompareFunction.LessEqual);
+
+        // Keep in transparent range but depth-tested.
+        m.renderQueue = 3000;
+        return m;
+    }
+
+    private static Material CreateDepthTestedTextMaterial()
+    {
+        // Hidden/Internal-TextMeshPro is a fallback for TextMeshPro text objects.
+        Shader s = Shader.Find("Hidden/Internal-TextMeshPro");
+        if (s == null)
+            s = Shader.Find("Sprites/Default");
+        if (s == null)
+            return null;
+
+        var m = new Material(s);
+
+        // Force depth test/write when supported by the shader.
+        if (m.HasProperty("_ZWrite")) m.SetFloat("_ZWrite", 1f);
+        if (m.HasProperty("_ZTest")) m.SetFloat("_ZTest", (float)CompareFunction.LessEqual);
+
+        // Keep in transparent range but depth-tested.
+        m.renderQueue = 3000;
+        return m;
+    }
+
+    private static void CreateNameLabelTextMesh(
+        Transform panel,
+        string text,
+        float panelWidth,
+        float panelHeight,
+        float tipLen,
+        float panelThickness,
+        bool isBackSide,
+        Material textMat)
+    {
+        // Build a TextMesh object as a child of the panel.
+        var textGo = new GameObject("NameLabel");
+        textGo.transform.SetParent(panel, false);
+
+        var textMesh = textGo.AddComponent<TextMesh>();
+        textMesh.text = text;
+        textMesh.color = Color.black;
+        textMesh.anchor = TextAnchor.MiddleCenter;
+        textMesh.alignment = TextAlignment.Center;
+        textMesh.fontSize = 0.08f;
+        textMesh.richText = true;
+
+        // Counteract mirroring that can happen with TextMesh on the back side.
+        if (isBackSide)
+            textGo.transform.localScale = new Vector3(-1f, 1f, 1f);
+
+        textMesh.font = GetBuiltinArialFont();
+        textMesh.fontStyle = FontStyle.Bold;
+
+        // BestFit shrinks to keep within rect
+        textMesh.GetComponent<Renderer>().material = textMat;
+        textMesh.GetComponent<Renderer>().shadowCastingMode = ShadowCastingMode.Off;
+        textMesh.GetComponent<Renderer>().receiveShadows = false;
+
+        // Disable raycast so it doesn't interfere
+        textMesh.GetComponent<Collider>().enabled = false;
     }
 }
 
