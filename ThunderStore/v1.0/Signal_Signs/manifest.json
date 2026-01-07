@@ -1,0 +1,9 @@
+{
+  "name": "PeakSigns",
+  "version_number": "1.0.0",
+  "website_url": "https://github.com/Mitschpielen/Signal_Signs",
+  "description": "Adds wall-aligned signs and markers to PEAK.",
+  "dependencies": [
+    "BepInEx-BepInExPack-5.4.2100"
+  ]
+}

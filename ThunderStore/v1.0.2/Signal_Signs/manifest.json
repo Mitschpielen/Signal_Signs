@@ -1,0 +1,9 @@
+{
+  "name": "PeakSigns",
+  "version_number": "1.0.2",
+  "website_url": "https://github.com/Mitschpielen/Signal_Signs",
+  "description": "Place wall-aligned signs and arrows in PEAK. Middle mouse to place, hold to remove. Signs inherit the placing player's color. Multiplayer ready.",
+  "dependencies": [
+    "BepInEx-BepInExPack-5.4.2100"
+  ]
+}
