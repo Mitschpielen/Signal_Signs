@@ -5,7 +5,6 @@ C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\D
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\Assembly-CSharp.dll
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\BepInEx.dll
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\BepInEx.Harmony.dll
-C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.CoreModule.dll
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.dll
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.InputLegacyModule.dll
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.PhysicsModule.dll
@@ -74,7 +73,6 @@ C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\D
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.UnityAnalyticsModule.dll
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.PerformanceReportingModule.dll
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.Physics2DModule.dll
-C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.AssetBundleModule.dll
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.SharedInternalsModule.dll
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.ClothModule.dll
 C:\Users\Mitsc\Desktop\Projekte\Peak\Signal_SignsObject\Signal_SignsObject\bin\Debug\UnityEngine.ClusterInputModule.dll
