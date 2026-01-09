@@ -1,0 +1,40 @@
+ManifestFileVersion: 0
+UnityVersion: 6000.0.64f1
+CRC: 2015124532
+Hashes:
+  AssetFileHash:
+    serializedVersion: 2
+    Hash: 540ef2fe9770f97f87c067da7097f1c2
+  TypeTreeHash:
+    serializedVersion: 2
+    Hash: d288eb1d0cd4a4d0c2a46d4e0957cc55
+  IncrementalBuildHash:
+    serializedVersion: 2
+    Hash: 54e05a9b385c9d7862edf34d4fc06223
+HashAppended: 0
+ClassTypes:
+- Class: 1
+  Script: {instanceID: 0}
+- Class: 4
+  Script: {instanceID: 0}
+- Class: 21
+  Script: {instanceID: 0}
+- Class: 23
+  Script: {instanceID: 0}
+- Class: 33
+  Script: {instanceID: 0}
+- Class: 43
+  Script: {instanceID: 0}
+- Class: 48
+  Script: {instanceID: 0}
+- Class: 65
+  Script: {instanceID: 0}
+- Class: 136
+  Script: {instanceID: 0}
+SerializeReferenceClassIdentifiers: []
+Assets:
+- Assets/Peak/Prefabs/PeakPole01.prefab
+- Assets/Peak/Materials/Simple_Red.mat
+- Assets/Peak/Prefabs/MyCube.prefab
+- Assets/Peak/Prefabs/PeakSign01.fbx
+Dependencies: []
