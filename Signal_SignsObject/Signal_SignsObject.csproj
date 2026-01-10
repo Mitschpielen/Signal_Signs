@@ -93,5 +93,15 @@
     <Target Name="AfterBuild">
     </Target>
     -->
+    <ItemGroup>
+        <Reference Include="UnityEngine.CoreModule">
+            <HintPath>DEIN_PFAD\PEAK_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+        </Reference>
+
+        <!-- nur wenn diese Datei existiert -->
+        <Reference Include="UnityEngine.AssetBundleModule">
+            <HintPath>DEIN_PFAD\PEAK_Data\Managed\UnityEngine.AssetBundleModule.dll</HintPath>
+        </Reference>
+    </ItemGroup>
 
 </Project>

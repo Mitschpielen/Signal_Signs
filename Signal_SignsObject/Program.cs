@@ -1,7 +1,28 @@
-// PeakSigns.cs - komplette Datei
-// Klein + nur Front-Text + Name sicher + kompiliert
+
+// PeakSigns.cs - KOMPLETTE DATEI
+// Schild: prozedural + (optional) Asset-Variante mit Prefabs aus Bundle: PeakSign01 + PeakPole01 (+ optional PeakSignLabel01)
+// Farben: Panel = ownerColor, Pole = dunkler
+// Placement: Boden + Wand
+// MP Spawn/Delete + RoomCache
+// Progress UI Clone (UseItem radial)
+//
+// ✅ FIX 1: HOLD-LOCK (Delete vs Place) -> entscheidet beim MouseDown einmalig, verhindert Place-Blockade
+// ✅ FIX 2: VORLADEN + PREWARM -> AssetBundle/Prefabs laden + unsichtbar instantiieren + Shader vereinfachen
+//            => verhindert “Asset kommt erst nach ~6 Sekunden” (typisch Shader/Material warmup)
+// ✅ FIX 3: ASSET-PANEL ROTATION -> NICHT am Root “rumoffsetten”, sondern Visual-Child lokal drehen
+//            => funktioniert auch wenn Prefab Hierarchie/Vorrotation hat
+//
+// Controls:
+// - MiddleMouse (config) HOLD: Place / Delete
+//
+// WICHTIG: Im AssetBundle müssen die Prefab-Namen exakt so heißen:
+//  - PeakSign01
+//  - PeakPole01
+// Optional:
+//  - PeakSignLabel01 (WorldSpace UI/TMP/Text)
 
 using System;
+using System.IO;
 using System.Collections.Generic;
 using System.Reflection;
 
@@ -26,6 +47,14 @@ public class PeakSigns : BaseUnityPlugin
     private ConfigEntry<float> _deleteHoldSeconds;
     private ConfigEntry<float> _placeHoldSeconds;
 
+    // AssetSign Config
+    private ConfigEntry<bool> _useAssetSign;
+    private ConfigEntry<string> _assetBundleName;
+
+    // Asset rotation offsets
+    private ConfigEntry<float> _assetPanelYawOffset;
+    private ConfigEntry<float> _assetPoleYawOffset; // meist 0, optional
+
     // Farben (UI Progress)
     private readonly Color _deleteColor = new Color(1f, 0.35f, 0.10f, 1f);
     private readonly Color _placeColor  = new Color(0.10f, 1.0f, 0.20f, 1f);
@@ -36,6 +65,7 @@ public class PeakSigns : BaseUnityPlugin
     private bool _placedThisHold;
 
     private GameObject _deleteTarget;
+    private bool _holdIsDelete;
 
     // -------- Signs (lokal + MP) --------
     private readonly Dictionary<int, GameObject> _signsById = new Dictionary<int, GameObject>();
@@ -57,10 +87,25 @@ public class PeakSigns : BaseUnityPlugin
     private int _localCounter = 0;
 
     // -------- Cached Reflection Handles --------
-    private static object _cachedCustomization;          // Singleton<Customization>.Instance
-    private static Type _ccType;                         // CharacterCustomization type
-    private static MethodInfo _ccGetDataMethod;          // customization-data method
+    private static object _cachedCustomization;
+    private static Type _ccType;
+    private static MethodInfo _ccGetDataMethod;
     private static bool _ccSearched;
+
+    // =========================
+    // Asset-Sign (Prefabs in Bundle)
+    // =========================
+    private const string SIGN_BUNDLE_NAME_DEFAULT = "peaksignsassets";
+    private const string ASSET_PANEL_PREFAB = "PeakSign01";
+    private const string ASSET_POLE_PREFAB  = "PeakPole01";
+    private const string ASSET_LABEL_PREFAB = "PeakSignLabel01"; // optional
+
+    private AssetBundle _signBundle;
+    private GameObject _assetPanelPrefab;
+    private GameObject _assetPolePrefab;
+    private GameObject _assetLabelPrefab;
+
+    private bool _assetPrewarmed;
 
     private void Awake()
     {
@@ -70,9 +115,16 @@ public class PeakSigns : BaseUnityPlugin
         _deleteHoldSeconds = Config.Bind("Delete", "HoldSeconds", 0.5f, "Hold-Zeit zum Löschen.");
         _placeHoldSeconds  = Config.Bind("Placement", "HoldSeconds", 0.0125f, "Hold-Zeit zum Platzieren.");
 
+        _useAssetSign = Config.Bind("AssetSign", "UseAssetSign", true, "Wenn true: versucht Panel/Pole aus AssetBundle zu laden (PeakSign01 + PeakPole01).");
+        _assetBundleName = Config.Bind("AssetSign", "BundleName", SIGN_BUNDLE_NAME_DEFAULT, "AssetBundle Dateiname (ohne Endung).");
+
+        _assetPanelYawOffset = Config.Bind("AssetSign", "PanelYawOffset", 90f, "Yaw-Offset fürs Asset-Panel (Grad).");
+
+        _assetPoleYawOffset  = Config.Bind("AssetSign", "PoleYawOffset", 0f, "Yaw-Offset fürs Asset-Pole (Grad). Meist 0.");
+
         _nextRecolorAt = Time.unscaledTime + RECOLOR_INTERVAL;
 
-        Logger.LogInfo("Peak Signs 1.0.0 geladen (Name: klein + nur Front).");
+        Logger.LogInfo("Peak Signs 1.0.0 geladen (Asset preload+prewarm + rotation fix).");
     }
 
     private void OnEnable()
@@ -90,6 +142,13 @@ public class PeakSigns : BaseUnityPlugin
     private void Start()
     {
         TrySetupUseItemProgress();
+
+        // Preload + Prewarm
+        if (_useAssetSign.Value)
+        {
+            TryLoadAssetSignPrefabs();
+            PrewarmAssetSign();
+        }
     }
 
     private void Update()
@@ -97,7 +156,6 @@ public class PeakSigns : BaseUnityPlugin
         if (!_progressReady)
             TrySetupUseItemProgress();
 
-        // alle 10s Farben nachfärben
         if (Time.unscaledTime >= _nextRecolorAt)
         {
             _nextRecolorAt = Time.unscaledTime + RECOLOR_INTERVAL;
@@ -111,18 +169,17 @@ public class PeakSigns : BaseUnityPlugin
             _isHolding = true;
             _holdStart = Time.unscaledTime;
             _placedThisHold = false;
+
             _deleteTarget = GetSignUnderCrosshair();
+            _holdIsDelete = (_deleteTarget != null);
         }
 
         if (_isHolding && Input.GetMouseButton(btn))
         {
             float held = Time.unscaledTime - _holdStart;
 
-            if (!_placedThisHold)
-                _deleteTarget = GetSignUnderCrosshair();
-
-            // FALL A: Löschen
-            if (_deleteTarget != null)
+            // DELETE
+            if (_holdIsDelete && _deleteTarget != null)
             {
                 float tDelete = Mathf.Clamp01(held / Mathf.Max(0.01f, _deleteHoldSeconds.Value));
                 ShowProgress(true, _deleteColor);
@@ -131,8 +188,7 @@ public class PeakSigns : BaseUnityPlugin
                 if (held >= _deleteHoldSeconds.Value)
                 {
                     int id = FindIdForSignObject(_deleteTarget);
-                    if (id != 0)
-                        RequestDelete(id);
+                    if (id != 0) RequestDelete(id);
 
                     _deleteTarget = null;
                     _isHolding = false;
@@ -141,7 +197,7 @@ public class PeakSigns : BaseUnityPlugin
                 return;
             }
 
-            // FALL B: Platzieren
+            // PLACE
             float tPlace = Mathf.Clamp01(held / Mathf.Max(0.01f, _placeHoldSeconds.Value));
             ShowProgress(true, _placeColor);
             SetProgress(tPlace);
@@ -162,6 +218,7 @@ public class PeakSigns : BaseUnityPlugin
         {
             _isHolding = false;
             _deleteTarget = null;
+            _holdIsDelete = false;
             ShowProgress(false, _deleteColor);
             ShowProgress(false, _placeColor);
         }
@@ -170,7 +227,6 @@ public class PeakSigns : BaseUnityPlugin
     // =========================
     // Multiplayer Requests
     // =========================
-
     private void RequestSpawn(int id, Vector3 pos, Quaternion rot, Vector3 normal, bool isWall)
     {
         int ownerActor = (PhotonNetwork.IsConnected ? PhotonNetwork.LocalPlayer.ActorNumber : 0);
@@ -269,7 +325,6 @@ public class PeakSigns : BaseUnityPlugin
     // =========================
     // Spawn/Delete Local
     // =========================
-
     private void SpawnLocal(int id, int ownerActor, Vector3 pos, Quaternion rot, Vector3 normal, bool isWall)
     {
         if (_signsById.ContainsKey(id))
@@ -318,7 +373,6 @@ public class PeakSigns : BaseUnityPlugin
     // =========================
     // Placement (Boden + Wand)
     // =========================
-
     private bool TryGetPlacement(out Vector3 placePos, out Quaternion rot, out Vector3 surfaceNormal, out bool isWall)
     {
         placePos = Vector3.zero;
@@ -340,9 +394,10 @@ public class PeakSigns : BaseUnityPlugin
 
         if (!isWall)
         {
-            Vector3 fwdFlat = Vector3.ProjectOnPlane(cam.transform.forward, Vector3.up);
-            if (fwdFlat.sqrMagnitude < 0.0001f) fwdFlat = Vector3.forward;
-            rot = Quaternion.LookRotation(fwdFlat.normalized, Vector3.up);
+            Vector3 fwd = surfaceNormal;
+            Vector3 up = Vector3.up;
+            if (Vector3.Cross(up, fwd).sqrMagnitude < 0.0001f)
+                up = cam.transform.up;
         }
         else
         {
@@ -372,10 +427,322 @@ public class PeakSigns : BaseUnityPlugin
     }
 
     // =========================
-    // Sign Visual
+    // Create Sign (Asset first, else procedural)
     // =========================
-
     private GameObject CreateSign(Vector3 placePos, Quaternion rot, Vector3 surfaceNormal, bool isWall, int signId, int ownerActor, Color ownerColor)
+    {
+        if (_useAssetSign.Value)
+        {
+            GameObject asset = CreateSignFromAssets(placePos, rot, surfaceNormal, isWall, signId, ownerActor, ownerColor);
+            if (asset != null)
+                return asset;
+        }
+
+        return CreateSignProcedural(placePos, rot, surfaceNormal, isWall, signId, ownerActor, ownerColor);
+    }
+
+    // =========================
+    // AssetSign Loader
+    // =========================
+    private void TryLoadAssetSignPrefabs()
+    {
+        try
+        {
+            if (_signBundle != null && _assetPanelPrefab != null && _assetPolePrefab != null)
+                return;
+
+            string pluginDir = Paths.PluginPath;
+            string dllDir = Path.GetDirectoryName(Info.Location) ?? pluginDir;
+
+            string bundleFile = _assetBundleName.Value?.Trim();
+            if (string.IsNullOrWhiteSpace(bundleFile))
+                bundleFile = SIGN_BUNDLE_NAME_DEFAULT;
+
+            string[] candidates =
+            {
+                Path.Combine(pluginDir, bundleFile),
+                Path.Combine(pluginDir, bundleFile + ".bundle"),
+                Path.Combine(pluginDir, bundleFile + ".assetbundle"),
+
+                Path.Combine(dllDir, bundleFile),
+                Path.Combine(dllDir, bundleFile + ".bundle"),
+                Path.Combine(dllDir, bundleFile + ".assetbundle"),
+            };
+
+            string found = null;
+            foreach (var p in candidates)
+                if (File.Exists(p)) { found = p; break; }
+
+            if (found == null)
+            {
+                Logger.LogWarning($"[AssetSign] Bundle '{bundleFile}' nicht gefunden (z.B. in {pluginDir}).");
+                return;
+            }
+
+            if (_signBundle == null)
+            {
+                _signBundle = AssetBundle.LoadFromFile(found);
+                if (_signBundle == null)
+                {
+                    Logger.LogWarning($"[AssetSign] Bundle konnte nicht geladen werden: {found}");
+                    return;
+                }
+
+                Logger.LogInfo($"[AssetSign] Bundle OK: {found}");
+            }
+
+            if (_assetPanelPrefab == null)
+                _assetPanelPrefab = _signBundle.LoadAsset<GameObject>(ASSET_PANEL_PREFAB);
+            if (_assetPolePrefab == null)
+                _assetPolePrefab = _signBundle.LoadAsset<GameObject>(ASSET_POLE_PREFAB);
+            if (_assetLabelPrefab == null)
+                _assetLabelPrefab = _signBundle.LoadAsset<GameObject>(ASSET_LABEL_PREFAB);
+
+            if (_assetPanelPrefab == null)
+                Logger.LogWarning($"[AssetSign] Prefab '{ASSET_PANEL_PREFAB}' nicht im Bundle gefunden.");
+            if (_assetPolePrefab == null)
+                Logger.LogWarning($"[AssetSign] Prefab '{ASSET_POLE_PREFAB}' nicht im Bundle gefunden.");
+
+            if (_assetLabelPrefab == null)
+                Logger.LogWarning($"[AssetSign] Label-Prefab '{ASSET_LABEL_PREFAB}' nicht im Bundle gefunden (optional).");
+            else
+                Logger.LogInfo($"[AssetSign] Label-Prefab OK: {ASSET_LABEL_PREFAB}");
+
+            if (_assetPanelPrefab != null && _assetPolePrefab != null)
+                Logger.LogInfo($"[AssetSign] Prefabs OK: {ASSET_PANEL_PREFAB} + {ASSET_POLE_PREFAB}");
+        }
+        catch (Exception e)
+        {
+            Logger.LogWarning($"[AssetSign] TryLoadAssetSignPrefabs Exception: {e}");
+        }
+    }
+
+    // =========================
+    // PREWARM
+    // =========================
+    private void PrewarmAssetSign()
+    {
+        if (_assetPrewarmed) return;
+
+        try
+        {
+            if (_assetPanelPrefab == null || _assetPolePrefab == null)
+            {
+                Logger.LogWarning("[AssetSign] Prewarm skipped (prefabs missing).");
+                return;
+            }
+
+            GameObject tmpRoot = new GameObject("PeakSign_Prewarm");
+            tmpRoot.SetActive(false);
+
+            GameObject tmpPanel = Instantiate(_assetPanelPrefab, tmpRoot.transform, false);
+            GameObject tmpPole  = Instantiate(_assetPolePrefab,  tmpRoot.transform, false);
+
+            ForceSimpleShaders(tmpPanel);
+            ForceSimpleShaders(tmpPole);
+
+            _ = tmpPanel.GetComponentsInChildren<Renderer>(true);
+            _ = tmpPole.GetComponentsInChildren<Renderer>(true);
+
+            Destroy(tmpRoot);
+
+            _assetPrewarmed = true;
+            Logger.LogInfo("[AssetSign] Prewarm done.");
+        }
+        catch (Exception e)
+        {
+            Logger.LogWarning($"[AssetSign] Prewarm failed: {e}");
+        }
+    }
+
+    private static void ForceSimpleShaders(GameObject root)
+    {
+        if (root == null) return;
+
+        Shader unlit = Shader.Find("Unlit/Color");
+        Shader standard = Shader.Find("Standard");
+
+        var renderers = root.GetComponentsInChildren<Renderer>(true);
+        foreach (var r in renderers)
+        {
+            if (r == null) continue;
+
+            var mats = r.materials;
+            if (mats == null) continue;
+
+            for (int i = 0; i < mats.Length; i++)
+            {
+                var m = mats[i];
+                if (m == null) continue;
+
+                if (unlit != null) m.shader = unlit;
+                else if (standard != null) m.shader = standard;
+
+                if (m.HasProperty("_Color")) m.color = Color.white;
+                if (m.HasProperty("_BaseColor")) m.SetColor("_BaseColor", Color.white);
+            }
+        }
+    }
+
+    // =========================
+    // ASSET ROTATION FIX: Visual-Child finden
+    // =========================
+    private static Transform FindPanelVisual(Transform panelRoot)
+    {
+        if (panelRoot == null) return null;
+
+        var rs = panelRoot.GetComponentsInChildren<Renderer>(true);
+        Transform best = null;
+        float bestSize = 0f;
+
+        foreach (var r in rs)
+        {
+            if (r == null) continue;
+
+            string n = r.name ?? "";
+            if (n.IndexOf("Label", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+            if (n.IndexOf("Text", StringComparison.OrdinalIgnoreCase) >= 0) continue;
+
+            float s = r.bounds.size.sqrMagnitude;
+            if (s > bestSize) { bestSize = s; best = r.transform; }
+        }
+
+        return best != null ? best : panelRoot;
+    }
+
+    // =========================
+    // AssetSign Create
+    // =========================
+    private GameObject CreateSignFromAssets(Vector3 placePos, Quaternion rot, Vector3 surfaceNormal, bool isWall, int signId, int ownerActor, Color ownerColor)
+    {
+        TryLoadAssetSignPrefabs();
+
+        if (_assetPanelPrefab == null || _assetPolePrefab == null)
+        {
+            Logger.LogWarning("[AssetSign] Fallback -> prozedurales Schild (Assets nicht geladen).");
+            return null;
+        }
+
+        if (!_assetPrewarmed)
+            PrewarmAssetSign();
+
+        GameObject root = new GameObject("PeakSign_Asset");
+        var marker = root.AddComponent<PeakSignMarker>();
+        marker.SignId = signId;
+        marker.OwnerActor = ownerActor;
+
+        GameObject panel = Instantiate(_assetPanelPrefab);
+        panel.name = "Panel";
+        panel.transform.SetParent(root.transform, false);
+
+        // ✅ Local offset auf Visual-Child (robust)
+        Transform visual = FindPanelVisual(panel.transform);
+        if (visual != null)
+        {
+            visual.localRotation = visual.localRotation * Quaternion.Euler(0f, _assetPanelYawOffset.Value, 0f);
+            Logger.LogInfo($"[AssetSign] PanelVisual='{visual.name}' localEuler={visual.localEulerAngles}");
+        }
+
+        GameObject pole = Instantiate(_assetPolePrefab);
+        pole.name = "Pole";
+        pole.transform.SetParent(root.transform, false);
+
+        // optional pole yaw offset (nur falls du’s brauchst)
+        if (Mathf.Abs(_assetPoleYawOffset.Value) > 0.001f)
+            pole.transform.localRotation = pole.transform.localRotation * Quaternion.Euler(0f, _assetPoleYawOffset.Value, 0f);
+
+        ForceSimpleShaders(panel);
+        ForceSimpleShaders(pole);
+
+        SetLayerRecursive(panel, 0);
+        SetLayerRecursive(pole, 0);
+
+        MakeAllCollidersTrigger(panel);
+        MakeAllCollidersTrigger(pole);
+
+        float wallGap = 0.03f;
+
+        if (!isWall)
+        {
+            panel.transform.position = placePos + Vector3.up * 0.85f;
+            panel.transform.rotation = rot;
+
+            pole.transform.position = placePos + Vector3.up * 0.45f;
+            pole.transform.rotation = rot;
+        }
+        else
+        {
+            Vector3 n = surfaceNormal.normalized;
+
+            Quaternion poleRot = Quaternion.FromToRotation(Vector3.up, n);
+            pole.transform.rotation = poleRot;
+
+            float poleLen = 1.0f;
+            var poleR = pole.GetComponentInChildren<Renderer>(true);
+            if (poleR != null) poleLen = Mathf.Max(0.3f, poleR.bounds.size.magnitude);
+
+            Vector3 poleCenter = placePos + n * (poleLen * 0.5f + wallGap);
+            pole.transform.position = poleCenter;
+
+            Vector3 forward = -n;
+
+            Camera cam = Camera.main;
+            Vector3 dirOnPlane = cam != null ? Vector3.ProjectOnPlane(cam.transform.forward, n) : Vector3.zero;
+            if (dirOnPlane.sqrMagnitude < 0.0001f)
+                dirOnPlane = Vector3.Cross(Vector3.up, n);
+            if (dirOnPlane.sqrMagnitude < 0.0001f)
+                dirOnPlane = Vector3.Cross(Vector3.forward, n);
+            dirOnPlane.Normalize();
+
+            Vector3 up = Vector3.Cross(forward, dirOnPlane).normalized;
+            if (up.sqrMagnitude < 0.0001f)
+                up = Vector3.ProjectOnPlane(Vector3.up, forward).normalized;
+
+            panel.transform.rotation = Quaternion.LookRotation(forward, up);
+            panel.transform.position = placePos + n * 0.06f;
+        }
+
+        ApplyColorToAllRenderers(panel, ownerColor);
+        ApplyColorToAllRenderers(pole, Color.Lerp(ownerColor, Color.black, 0.45f));
+
+        // Label
+        try
+        {
+            string playerName = GetOwnerPlayerName(ownerActor);
+
+            if (_assetLabelPrefab != null)
+            {
+                var label = Instantiate(_assetLabelPrefab);
+                label.name = "NameLabel";
+                label.transform.SetParent(panel.transform, false);
+
+                var anchor = panel.transform.Find("LabelAnchor");
+                if (anchor != null)
+                {
+                    label.transform.position = anchor.position;
+                    label.transform.rotation = anchor.rotation;
+                }
+
+                SetAnyTextOnLabel(label, playerName);
+                MakeLabelNonInteractive(label);
+            }
+            else
+            {
+                CreateNameLabelOnAssetPanel(panel.transform, playerName);
+            }
+        }
+        catch (Exception e)
+        {
+            Logger.LogWarning($"[AssetSign] NameLabel failed: {e}");
+        }
+
+        return root;
+    }
+
+    // =========================
+    // Procedural Create
+    // =========================
+    private GameObject CreateSignProcedural(Vector3 placePos, Quaternion rot, Vector3 surfaceNormal, bool isWall, int signId, int ownerActor, Color ownerColor)
     {
         GameObject root = new GameObject("PeakSign");
         var marker = root.AddComponent<PeakSignMarker>();
@@ -448,6 +815,7 @@ public class PeakSigns : BaseUnityPlugin
             if (up.sqrMagnitude < 0.0001f)
                 up = Vector3.ProjectOnPlane(Vector3.up, forward).normalized;
 
+            // ✅ Procedural NICHT AssetOffset benutzen
             panel.transform.rotation = Quaternion.LookRotation(forward, up);
         }
 
@@ -457,12 +825,11 @@ public class PeakSigns : BaseUnityPlugin
         ApplyUnlit(panel, ownerColor);
         ApplyUnlit(pole, Color.Lerp(ownerColor, Color.black, 0.45f));
 
-        // ✅ NUR Front-Text, kleiner
+        // Front-Text
         try
         {
             string playerName = GetOwnerPlayerName(ownerActor);
             CreateNameLabelTextMesh_FrontOnly(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness);
-            Logger.LogInfo($"NameLabel erstellt: '{playerName}' ownerActor={ownerActor}");
         }
         catch (Exception e)
         {
@@ -472,11 +839,14 @@ public class PeakSigns : BaseUnityPlugin
         return root;
     }
 
+    // =========================
+    // Simple helpers
+    // =========================
     private static void MakeNoHitbox(GameObject go)
     {
         Collider c = go.GetComponent<Collider>();
         if (c != null) c.isTrigger = true;
-        go.layer = 2; // Ignore Raycast
+        go.layer = 0;
     }
 
     private static void ApplyUnlit(GameObject go, Color c)
@@ -497,6 +867,155 @@ public class PeakSigns : BaseUnityPlugin
         mr.receiveShadows = true;
     }
 
+    // =========================
+    // Asset Helpers
+    // =========================
+    private static void ApplyColorToAllRenderers(GameObject root, Color c)
+    {
+        if (root == null) return;
+
+        var renderers = root.GetComponentsInChildren<Renderer>(true);
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            var r = renderers[i];
+            if (r == null) continue;
+
+            var mats = r.materials;
+            if (mats == null) continue;
+
+            for (int m = 0; m < mats.Length; m++)
+            {
+                var mat = mats[m];
+                if (mat == null) continue;
+
+                if (mat.HasProperty("_Color")) mat.color = c;
+                if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", c);
+            }
+
+            r.enabled = true;
+        }
+    }
+
+    private static void MakeAllCollidersTrigger(GameObject root)
+    {
+        if (root == null) return;
+        var cols = root.GetComponentsInChildren<Collider>(true);
+        foreach (var c in cols)
+            if (c != null) c.isTrigger = true;
+    }
+
+    private static void SetLayerRecursive(GameObject go, int layer)
+    {
+        if (go == null) return;
+        go.layer = layer;
+        foreach (Transform t in go.transform)
+            if (t != null) SetLayerRecursive(t.gameObject, layer);
+    }
+
+    // =========================
+    // Label Helpers (Asset UI/Text/TMP)
+    // =========================
+    private static void SetAnyTextOnLabel(GameObject labelRoot, string text)
+    {
+        if (labelRoot == null) return;
+        if (string.IsNullOrWhiteSpace(text)) text = "Player";
+
+        // TMP (Reflection)
+        try
+        {
+            var comps = labelRoot.GetComponentsInChildren<Component>(true);
+            foreach (var c in comps)
+            {
+                if (c == null) continue;
+                var t = c.GetType();
+                if (t == null) continue;
+
+                if (t.FullName != null && t.FullName.Contains("TMPro"))
+                {
+                    var p = t.GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
+                    if (p != null && p.CanWrite)
+                        p.SetValue(c, text, null);
+                }
+            }
+        }
+        catch { }
+
+        // Unity UI Text
+        try
+        {
+            var uiTexts = labelRoot.GetComponentsInChildren<UnityEngine.UI.Text>(true);
+            foreach (var t in uiTexts)
+                if (t != null) t.text = text;
+        }
+        catch { }
+
+        // 3D TextMesh
+        try
+        {
+            var tms = labelRoot.GetComponentsInChildren<TextMesh>(true);
+            foreach (var tm in tms)
+                if (tm != null) tm.text = text;
+        }
+        catch { }
+    }
+
+    private static void MakeLabelNonInteractive(GameObject labelRoot)
+    {
+        if (labelRoot == null) return;
+
+        var raycasters = labelRoot.GetComponentsInChildren<GraphicRaycaster>(true);
+        foreach (var r in raycasters)
+            if (r != null) r.enabled = false;
+
+        var graphics = labelRoot.GetComponentsInChildren<Graphic>(true);
+        foreach (var g in graphics)
+            if (g != null) g.raycastTarget = false;
+
+        SetLayerRecursive(labelRoot, 0);
+    }
+
+    private static void CreateNameLabelOnAssetPanel(Transform panel, string text)
+    {
+        GameObject textGo = new GameObject("NameLabel");
+        textGo.transform.SetParent(panel, false);
+
+        TextMesh tm = textGo.AddComponent<TextMesh>();
+        tm.text = string.IsNullOrWhiteSpace(text) ? "Player" : text;
+
+        tm.anchor = TextAnchor.MiddleCenter;
+        tm.alignment = TextAlignment.Center;
+        tm.color = Color.black;
+
+        tm.font = Resources.GetBuiltinResource<Font>("Arial.ttf");
+        tm.fontStyle = FontStyle.Bold;
+
+        tm.fontSize = 56;
+        tm.characterSize = 0.075f;
+        tm.richText = false;
+
+        textGo.transform.localPosition = new Vector3(0f, 0f, 0.01f);
+        textGo.transform.localRotation = Quaternion.identity;
+
+        MeshRenderer mr = textGo.GetComponent<MeshRenderer>();
+        if (mr != null)
+        {
+            Material mat = new Material(tm.font.material);
+            mat.renderQueue = 3100;
+
+            if (mat.HasProperty("_ZWrite")) mat.SetFloat("_ZWrite", 0f);
+            if (mat.HasProperty("_ZTest")) mat.SetFloat("_ZTest", (float)CompareFunction.LessEqual);
+
+            mr.material = mat;
+            mr.shadowCastingMode = ShadowCastingMode.Off;
+            mr.receiveShadows = false;
+            mr.sortingOrder = 5000;
+            mr.enabled = true;
+        }
+    }
+
+    // =========================
+    // Text (Procedural)
+    // =========================
     private static Font GetBuiltinArialFont()
     {
         return Resources.GetBuiltinResource<Font>("Arial.ttf");
@@ -536,7 +1055,6 @@ public class PeakSigns : BaseUnityPlugin
         tm.font = GetBuiltinArialFont();
         tm.fontStyle = FontStyle.Bold;
 
-        // ✅ kleiner
         tm.fontSize = 56;
         tm.characterSize = 0.075f;
         tm.richText = false;
@@ -544,7 +1062,6 @@ public class PeakSigns : BaseUnityPlugin
         float bodyWidth = Mathf.Max(0.1f, panelWidth - tipLen);
         float xCenter = -(tipLen * 0.25f);
 
-        // Front: etwas raus, aber kleiner Offset
         float zOut = (panelThickness * 0.5f) + 0.010f;
 
         textGo.transform.localPosition = new Vector3(xCenter, 0f, zOut);
@@ -568,7 +1085,6 @@ public class PeakSigns : BaseUnityPlugin
         FitTextMeshToPanelBounds_ShrinkOnly(tm, maxWidth, maxHeight, baseCharacterSize: 0.075f, minCharacterSize: 0.04f);
     }
 
-    // ✅ shrink-only, nie "..."
     private static void FitTextMeshToPanelBounds_ShrinkOnly(TextMesh textMesh, float maxWidth, float maxHeight, float baseCharacterSize, float minCharacterSize)
     {
         if (textMesh == null) return;
@@ -617,7 +1133,7 @@ public class PeakSigns : BaseUnityPlugin
     }
 
     // =========================
-    // Arrow Mesh
+    // Arrow Mesh (Procedural)
     // =========================
     private static Mesh CreateArrowMesh(float width, float height, float thickness, float tipLength)
     {
@@ -730,16 +1246,16 @@ public class PeakSigns : BaseUnityPlugin
 
             Transform panelT = root.transform.Find("Panel");
             if (panelT != null)
-                SetRendererColor(panelT.GetComponent<MeshRenderer>(), ownerColor);
+                ApplyColorToAllRenderers(panelT.gameObject, ownerColor);
 
             Transform poleT = root.transform.Find("Pole");
             if (poleT != null)
-                SetRendererColor(poleT.GetComponent<MeshRenderer>(), Color.Lerp(ownerColor, Color.black, 0.45f));
+                ApplyColorToAllRenderers(poleT.gameObject, Color.Lerp(ownerColor, Color.black, 0.45f));
         }
     }
 
     // =========================
-    // Progress UI (UseItem Clone)
+    // Progress UI
     // =========================
     private void ShowProgress(bool visible, Color color)
     {
@@ -902,32 +1418,6 @@ public class PeakSigns : BaseUnityPlugin
     }
 
     // =========================
-    // SetRendererColor helper
-    // =========================
-    private static void SetRendererColor(MeshRenderer mr, Color c)
-    {
-        if (mr == null) return;
-
-        Material m = mr.material;
-        if (m == null)
-        {
-            Shader s0 = Shader.Find("Unlit/Color");
-            if (s0 == null) s0 = Shader.Find("Standard");
-            m = new Material(s0);
-            mr.material = m;
-        }
-
-        Shader s = Shader.Find("Unlit/Color");
-        if (s != null && mr.material.shader != s)
-            mr.material.shader = s;
-
-        if (mr.material.HasProperty("_Color"))
-            mr.material.color = c;
-
-        mr.enabled = true;
-    }
-
-    // =========================
     // Customization Reflection
     // =========================
     private static Color GetOwnerPlayerColor(int ownerActor)
@@ -1085,3 +1575,4 @@ public class PeakSignMarker : MonoBehaviour
     public int SignId;
     public int OwnerActor;
 }
+
