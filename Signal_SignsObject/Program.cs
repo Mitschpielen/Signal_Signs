@@ -1,5 +1,4 @@
-// PeakSigns.cs - komplette Datei
-// Klein + nur Front-Text + Name sicher + kompiliert
+// PeakSigns.cs
 
 using System;
 using System.Collections.Generic;
@@ -54,12 +53,12 @@ public class PeakSigns : BaseUnityPlugin
     private const float RECOLOR_INTERVAL = 10f;
 
     // -------- Stable ID --------
-    private int _localCounter = 0;
+    private int _localCounter;
 
     // -------- Cached Reflection Handles --------
-    private static object _cachedCustomization;          // Singleton<Customization>.Instance
-    private static Type _ccType;                         // CharacterCustomization type
-    private static MethodInfo _ccGetDataMethod;          // customization-data method
+    private static object _cachedCustomization;
+    private static Type _ccType;
+    private static MethodInfo _ccGetDataMethod;
     private static bool _ccSearched;
 
     private void Awake()
@@ -461,7 +460,8 @@ public class PeakSigns : BaseUnityPlugin
         try
         {
             string playerName = GetOwnerPlayerName(ownerActor);
-            CreateNameLabelTextMesh_FrontOnly(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness);
+            // Render on both sides, keep text inside the sign bounds, and depth-test so it doesn't show through walls.
+            CreateNameLabelTextMesh_BothSides(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness);
             Logger.LogInfo($"NameLabel erstellt: '{playerName}' ownerActor={ownerActor}");
         }
         catch (Exception e)
@@ -507,7 +507,7 @@ public class PeakSigns : BaseUnityPlugin
         if (font == null || font.material == null) return null;
 
         Material m = new Material(font.material);
-        m.renderQueue = 3100;
+        m.renderQueue = 2450;
 
         if (m.HasProperty("_ZWrite")) m.SetFloat("_ZWrite", 0f);
         if (m.HasProperty("_ZTest")) m.SetFloat("_ZTest", (float)CompareFunction.LessEqual);
@@ -515,7 +515,7 @@ public class PeakSigns : BaseUnityPlugin
         return m;
     }
 
-    private static void CreateNameLabelTextMesh_FrontOnly(
+    private static void CreateNameLabelTextMesh_BothSides(
         Transform panel,
         string text,
         float panelWidth,
@@ -523,32 +523,49 @@ public class PeakSigns : BaseUnityPlugin
         float tipLen,
         float panelThickness)
     {
-        GameObject textGo = new GameObject("NameLabel");
+        // Front
+        CreateNameLabelTextMesh_Side(panel, text, panelWidth, panelHeight, tipLen, panelThickness, isBackSide: false);
+        // Back
+        CreateNameLabelTextMesh_Side(panel, text, panelWidth, panelHeight, tipLen, panelThickness, isBackSide: true);
+    }
+
+    private static void CreateNameLabelTextMesh_Side(
+        Transform panel,
+        string text,
+        float panelWidth,
+        float panelHeight,
+        float tipLen,
+        float panelThickness,
+        bool isBackSide)
+    {
+        string goName = isBackSide ? "NameLabel_Back" : "NameLabel_Front";
+        GameObject textGo = new GameObject(goName);
         textGo.transform.SetParent(panel, false);
 
         TextMesh tm = textGo.AddComponent<TextMesh>();
         tm.text = string.IsNullOrWhiteSpace(text) ? "Player" : text;
-
         tm.anchor = TextAnchor.MiddleCenter;
         tm.alignment = TextAlignment.Center;
         tm.color = Color.black;
-
         tm.font = GetBuiltinArialFont();
         tm.fontStyle = FontStyle.Bold;
-
-        // ✅ kleiner
         tm.fontSize = 56;
         tm.characterSize = 0.075f;
         tm.richText = false;
 
+        // Keep the label inside the arrow body (avoid the pointed tip area).
         float bodyWidth = Mathf.Max(0.1f, panelWidth - tipLen);
         float xCenter = -(tipLen * 0.25f);
 
-        // Front: etwas raus, aber kleiner Offset
-        float zOut = (panelThickness * 0.5f) + 0.010f;
+        // Place slightly above the surface to avoid z-fighting, but keep it depth-tested.
+        float epsilon = 0.006f;
+        float z = (panelThickness * 0.5f) + epsilon;
+        if (isBackSide) z = -z;
 
-        textGo.transform.localPosition = new Vector3(xCenter, 0f, zOut);
-        textGo.transform.localRotation = Quaternion.identity;
+        textGo.transform.localPosition = new Vector3(xCenter, 0f, z);
+
+        // Back side needs a 180° Y rotation so it reads correctly (not mirrored).
+        textGo.transform.localRotation = isBackSide ? Quaternion.Euler(0f, 180f, 0f) : Quaternion.identity;
 
         MeshRenderer mr = textGo.GetComponent<MeshRenderer>();
         if (mr != null)
@@ -558,12 +575,12 @@ public class PeakSigns : BaseUnityPlugin
 
             mr.shadowCastingMode = ShadowCastingMode.Off;
             mr.receiveShadows = false;
-            mr.sortingOrder = 5000;
             mr.enabled = true;
         }
 
-        float maxWidth  = bodyWidth * 0.85f;
-        float maxHeight = panelHeight * 0.70f;
+        // Fit text to be *inside* the sign face.
+        float maxWidth = bodyWidth * 0.80f;
+        float maxHeight = panelHeight * 0.60f;
 
         FitTextMeshToPanelBounds_ShrinkOnly(tm, maxWidth, maxHeight, baseCharacterSize: 0.075f, minCharacterSize: 0.04f);
     }
