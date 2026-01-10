@@ -1,18 +1,22 @@
 // PeakSigns.cs - KOMPLETTE DATEI
-// Schild: prozedural + (optional) Asset-Variante mit 2 Prefabs aus Bundle: PeakSign01 + PeakPole01
+// Schild: prozedural + (optional) Asset-Variante mit Prefabs aus Bundle: PeakSign01 + PeakPole01 (+ optional PeakSignLabel01)
 // Farben: Panel = ownerColor, Pole = dunkler
 // Placement: Boden + Wand
 // MP Spawn/Delete + RoomCache
 // Progress UI Clone (UseItem radial)
-// AssetBundle-Pfad: BepInEx\plugins\<BundleName>[.assetbundle/.bundle] oder neben DLL
+//
+// ✅ FIX 1: HOLD-LOCK (Delete vs Place) -> entscheidet beim MouseDown einmalig, verhindert Place-Blockade
+// ✅ FIX 2: VORLADEN + PREWARM -> AssetBundle/Prefabs laden + unsichtbar instantiieren + Shader vereinfachen
+//            => verhindert “Asset kommt erst nach ~6 Sekunden” (typisch Shader/Material warmup)
 //
 // Controls:
-// - MiddleMouse (config) HOLD: Place / Delete (wie vorher)
-// - Config: AssetSign.UseAssetSign = true => versucht Asset-Variante, sonst prozedural
+// - MiddleMouse (config) HOLD: Place / Delete
 //
 // WICHTIG: Im AssetBundle müssen die Prefab-Namen exakt so heißen:
 //  - PeakSign01
 //  - PeakPole01
+// Optional:
+//  - PeakSignLabel01 (WorldSpace UI/TMP/Text)
 
 using System;
 using System.IO;
@@ -54,6 +58,7 @@ public class PeakSigns : BaseUnityPlugin
     private bool _placedThisHold;
 
     private GameObject _deleteTarget;
+    private bool _holdIsDelete; // ✅ FIX 1
 
     // -------- Signs (lokal + MP) --------
     private readonly Dictionary<int, GameObject> _signsById = new Dictionary<int, GameObject>();
@@ -81,15 +86,20 @@ public class PeakSigns : BaseUnityPlugin
     private static bool _ccSearched;
 
     // =========================
-    // Asset-Sign (2 Prefabs in Bundle)
+    // Asset-Sign (Prefabs in Bundle)
     // =========================
     private const string SIGN_BUNDLE_NAME_DEFAULT = "peaksignsassets";
     private const string ASSET_PANEL_PREFAB = "PeakSign01";
     private const string ASSET_POLE_PREFAB  = "PeakPole01";
+    private const string ASSET_LABEL_PREFAB = "PeakSignLabel01"; // optional
 
     private AssetBundle _signBundle;
     private GameObject _assetPanelPrefab;
     private GameObject _assetPolePrefab;
+    private GameObject _assetLabelPrefab;
+
+    // Prewarm flags
+    private bool _assetPrewarmed;
 
     private void Awake()
     {
@@ -104,7 +114,7 @@ public class PeakSigns : BaseUnityPlugin
 
         _nextRecolorAt = Time.unscaledTime + RECOLOR_INTERVAL;
 
-        Logger.LogInfo("Peak Signs 1.0.0 geladen (Prozedural + AssetSign optional).");
+        Logger.LogInfo("Peak Signs 1.0.0 geladen (Prozedural + AssetSign optional + AssetLabel optional).");
     }
 
     private void OnEnable()
@@ -122,6 +132,13 @@ public class PeakSigns : BaseUnityPlugin
     private void Start()
     {
         TrySetupUseItemProgress();
+
+        // ✅ FIX 2: VORLADEN + PREWARM -> verhindert 6s "unsichtbar bis Shader warm"
+        if (_useAssetSign.Value)
+        {
+            TryLoadAssetSignPrefabs();
+            PrewarmAssetSign(); // warmup instantiation + shader simplify
+        }
     }
 
     private void Update()
@@ -143,18 +160,18 @@ public class PeakSigns : BaseUnityPlugin
             _isHolding = true;
             _holdStart = Time.unscaledTime;
             _placedThisHold = false;
+
+            // ✅ FIX 1: Einmalig entscheiden ob Delete oder Place
             _deleteTarget = GetSignUnderCrosshair();
+            _holdIsDelete = (_deleteTarget != null);
         }
 
         if (_isHolding && Input.GetMouseButton(btn))
         {
             float held = Time.unscaledTime - _holdStart;
 
-            if (!_placedThisHold)
-                _deleteTarget = GetSignUnderCrosshair();
-
-            // FALL A: Löschen
-            if (_deleteTarget != null)
+            // FALL A: Löschen (nur wenn beim Hold-Start ein Schild anvisiert war)
+            if (_holdIsDelete && _deleteTarget != null)
             {
                 float tDelete = Mathf.Clamp01(held / Mathf.Max(0.01f, _deleteHoldSeconds.Value));
                 ShowProgress(true, _deleteColor);
@@ -194,6 +211,7 @@ public class PeakSigns : BaseUnityPlugin
         {
             _isHolding = false;
             _deleteTarget = null;
+            _holdIsDelete = false;
             ShowProgress(false, _deleteColor);
             ShowProgress(false, _placeColor);
         }
@@ -425,7 +443,8 @@ public class PeakSigns : BaseUnityPlugin
     {
         try
         {
-            if (_assetPanelPrefab != null && _assetPolePrefab != null) return;
+            if (_signBundle != null && _assetPanelPrefab != null && _assetPolePrefab != null)
+                return;
 
             string pluginDir = Paths.PluginPath;
             string dllDir = Path.GetDirectoryName(Info.Location) ?? pluginDir;
@@ -455,22 +474,34 @@ public class PeakSigns : BaseUnityPlugin
                 return;
             }
 
-            _signBundle = AssetBundle.LoadFromFile(found);
             if (_signBundle == null)
             {
-                Logger.LogWarning($"[AssetSign] Bundle konnte nicht geladen werden: {found}");
-                return;
+                _signBundle = AssetBundle.LoadFromFile(found);
+                if (_signBundle == null)
+                {
+                    Logger.LogWarning($"[AssetSign] Bundle konnte nicht geladen werden: {found}");
+                    return;
+                }
+
+                Logger.LogInfo($"[AssetSign] Bundle OK: {found}");
             }
 
-            Logger.LogInfo($"[AssetSign] Bundle OK: {found}");
-
-            _assetPanelPrefab = _signBundle.LoadAsset<GameObject>(ASSET_PANEL_PREFAB);
-            _assetPolePrefab  = _signBundle.LoadAsset<GameObject>(ASSET_POLE_PREFAB);
+            if (_assetPanelPrefab == null)
+                _assetPanelPrefab = _signBundle.LoadAsset<GameObject>(ASSET_PANEL_PREFAB);
+            if (_assetPolePrefab == null)
+                _assetPolePrefab = _signBundle.LoadAsset<GameObject>(ASSET_POLE_PREFAB);
+            if (_assetLabelPrefab == null)
+                _assetLabelPrefab = _signBundle.LoadAsset<GameObject>(ASSET_LABEL_PREFAB);
 
             if (_assetPanelPrefab == null)
                 Logger.LogWarning($"[AssetSign] Prefab '{ASSET_PANEL_PREFAB}' nicht im Bundle gefunden.");
             if (_assetPolePrefab == null)
                 Logger.LogWarning($"[AssetSign] Prefab '{ASSET_POLE_PREFAB}' nicht im Bundle gefunden.");
+
+            if (_assetLabelPrefab == null)
+                Logger.LogWarning($"[AssetSign] Label-Prefab '{ASSET_LABEL_PREFAB}' nicht im Bundle gefunden (optional).");
+            else
+                Logger.LogInfo($"[AssetSign] Label-Prefab OK: {ASSET_LABEL_PREFAB}");
 
             if (_assetPanelPrefab != null && _assetPolePrefab != null)
                 Logger.LogInfo($"[AssetSign] Prefabs OK: {ASSET_PANEL_PREFAB} + {ASSET_POLE_PREFAB}");
@@ -482,7 +513,77 @@ public class PeakSigns : BaseUnityPlugin
     }
 
     // =========================
-    // AssetSign Create (2 Prefabs)
+    // ✅ PREWARM: Instanziere einmal unsichtbar + ersetze Shader auf Unlit/Standard
+    // -> verhindert, dass das erste echte Asset erst nach Sekunden gerendert wird.
+    // =========================
+    private void PrewarmAssetSign()
+    {
+        if (_assetPrewarmed) return;
+
+        try
+        {
+            if (_assetPanelPrefab == null || _assetPolePrefab == null)
+            {
+                Logger.LogWarning("[AssetSign] Prewarm skipped (prefabs missing).");
+                return;
+            }
+
+            GameObject tmpRoot = new GameObject("PeakSign_Prewarm");
+            tmpRoot.SetActive(false);
+
+            GameObject tmpPanel = Instantiate(_assetPanelPrefab, tmpRoot.transform, false);
+            GameObject tmpPole  = Instantiate(_assetPolePrefab,  tmpRoot.transform, false);
+
+            ForceSimpleShaders(tmpPanel);
+            ForceSimpleShaders(tmpPole);
+
+            // Renderer einmal anfassen (initialisiert intern häufig einiges)
+            _ = tmpPanel.GetComponentsInChildren<Renderer>(true);
+            _ = tmpPole.GetComponentsInChildren<Renderer>(true);
+
+            Destroy(tmpRoot);
+
+            _assetPrewarmed = true;
+            Logger.LogInfo("[AssetSign] Prewarm done.");
+        }
+        catch (Exception e)
+        {
+            Logger.LogWarning($"[AssetSign] Prewarm failed: {e}");
+        }
+    }
+
+    private static void ForceSimpleShaders(GameObject root)
+    {
+        if (root == null) return;
+
+        Shader unlit = Shader.Find("Unlit/Color");
+        Shader standard = Shader.Find("Standard");
+
+        var renderers = root.GetComponentsInChildren<Renderer>(true);
+        foreach (var r in renderers)
+        {
+            if (r == null) continue;
+
+            var mats = r.materials;
+            if (mats == null) continue;
+
+            for (int i = 0; i < mats.Length; i++)
+            {
+                var m = mats[i];
+                if (m == null) continue;
+
+                if (unlit != null) m.shader = unlit;
+                else if (standard != null) m.shader = standard;
+
+                // wenn möglich eine Farbe setzen, damit Unlit/Color sicher etwas zeigt
+                if (m.HasProperty("_Color")) m.color = Color.white;
+                if (m.HasProperty("_BaseColor")) m.SetColor("_BaseColor", Color.white);
+            }
+        }
+    }
+
+    // =========================
+    // AssetSign Create
     // =========================
     private GameObject CreateSignFromAssets(Vector3 placePos, Quaternion rot, Vector3 surfaceNormal, bool isWall, int signId, int ownerActor, Color ownerColor)
     {
@@ -494,12 +595,15 @@ public class PeakSigns : BaseUnityPlugin
             return null;
         }
 
+        // Safety: wenn Start() aus irgendeinem Grund nicht lief (Hot reload), prewarm hier einmal
+        if (!_assetPrewarmed)
+            PrewarmAssetSign();
+
         GameObject root = new GameObject("PeakSign_Asset");
         var marker = root.AddComponent<PeakSignMarker>();
         marker.SignId = signId;
         marker.OwnerActor = ownerActor;
 
-        // instantiate
         GameObject panel = Instantiate(_assetPanelPrefab);
         panel.name = "Panel";
         panel.transform.SetParent(root.transform, false);
@@ -508,15 +612,16 @@ public class PeakSigns : BaseUnityPlugin
         pole.name = "Pole";
         pole.transform.SetParent(root.transform, false);
 
-        // layer default
+        // ✅ auch beim echten Spawn Shader vereinfachen (damit garantiert sofort sichtbar)
+        ForceSimpleShaders(panel);
+        ForceSimpleShaders(pole);
+
         SetLayerRecursive(panel, 0);
         SetLayerRecursive(pole, 0);
 
-        // colliders trigger
         MakeAllCollidersTrigger(panel);
         MakeAllCollidersTrigger(pole);
 
-        // Placement
         float wallGap = 0.03f;
 
         if (!isWall)
@@ -534,7 +639,6 @@ public class PeakSigns : BaseUnityPlugin
             Quaternion poleRot = Quaternion.FromToRotation(Vector3.up, n);
             pole.transform.rotation = poleRot;
 
-            // grobe Länge aus Bounds (besser als Guess)
             float poleLen = 1.0f;
             var poleR = pole.GetComponentInChildren<Renderer>(true);
             if (poleR != null) poleLen = Mathf.Max(0.3f, poleR.bounds.size.magnitude);
@@ -564,12 +668,31 @@ public class PeakSigns : BaseUnityPlugin
         ApplyColorToAllRenderers(panel, ownerColor);
         ApplyColorToAllRenderers(pole, Color.Lerp(ownerColor, Color.black, 0.45f));
 
-        // Label (front-ish)
+        // Label (AssetLabel -> sonst TextMesh)
         try
         {
             string playerName = GetOwnerPlayerName(ownerActor);
-            CreateNameLabelOnAssetPanel(panel.transform, playerName);
-            Logger.LogInfo($"NameLabel erstellt: '{playerName}' ownerActor={ownerActor}");
+
+            if (_assetLabelPrefab != null)
+            {
+                var label = Instantiate(_assetLabelPrefab);
+                label.name = "NameLabel";
+                label.transform.SetParent(panel.transform, false);
+
+                var anchor = panel.transform.Find("LabelAnchor");
+                if (anchor != null)
+                {
+                    label.transform.position = anchor.position;
+                    label.transform.rotation = anchor.rotation;
+                }
+
+                SetAnyTextOnLabel(label, playerName);
+                MakeLabelNonInteractive(label);
+            }
+            else
+            {
+                CreateNameLabelOnAssetPanel(panel.transform, playerName);
+            }
         }
         catch (Exception e)
         {
@@ -580,7 +703,7 @@ public class PeakSigns : BaseUnityPlugin
     }
 
     // =========================
-    // Procedural Create (dein Schild wie vorher)
+    // Procedural Create
     // =========================
     private GameObject CreateSignProcedural(Vector3 placePos, Quaternion rot, Vector3 surfaceNormal, bool isWall, int signId, int ownerActor, Color ownerColor)
     {
@@ -669,7 +792,6 @@ public class PeakSigns : BaseUnityPlugin
         {
             string playerName = GetOwnerPlayerName(ownerActor);
             CreateNameLabelTextMesh_FrontOnly(panel.transform, playerName, panelWidth, panelHeight, tipLen, panelThickness);
-            Logger.LogInfo($"NameLabel erstellt: '{playerName}' ownerActor={ownerActor}");
         }
         catch (Exception e)
         {
@@ -683,7 +805,7 @@ public class PeakSigns : BaseUnityPlugin
     {
         Collider c = go.GetComponent<Collider>();
         if (c != null) c.isTrigger = true;
-        go.layer = 0; // Default
+        go.layer = 0;
     }
 
     private static void ApplyUnlit(GameObject go, Color c)
@@ -750,7 +872,69 @@ public class PeakSigns : BaseUnityPlugin
     }
 
     // =========================
-    // Asset NameLabel
+    // Label Helpers (Asset UI/Text/TMP)
+    // =========================
+    private static void SetAnyTextOnLabel(GameObject labelRoot, string text)
+    {
+        if (labelRoot == null) return;
+        if (string.IsNullOrWhiteSpace(text)) text = "Player";
+
+        // TMP (Reflection)
+        try
+        {
+            var comps = labelRoot.GetComponentsInChildren<Component>(true);
+            foreach (var c in comps)
+            {
+                if (c == null) continue;
+                var t = c.GetType();
+                if (t == null) continue;
+
+                if (t.FullName != null && t.FullName.Contains("TMPro"))
+                {
+                    var p = t.GetProperty("text", BindingFlags.Public | BindingFlags.Instance);
+                    if (p != null && p.CanWrite)
+                        p.SetValue(c, text, null);
+                }
+            }
+        }
+        catch { }
+
+        // Unity UI Text
+        try
+        {
+            var uiTexts = labelRoot.GetComponentsInChildren<UnityEngine.UI.Text>(true);
+            foreach (var t in uiTexts)
+                if (t != null) t.text = text;
+        }
+        catch { }
+
+        // 3D TextMesh
+        try
+        {
+            var tms = labelRoot.GetComponentsInChildren<TextMesh>(true);
+            foreach (var tm in tms)
+                if (tm != null) tm.text = text;
+        }
+        catch { }
+    }
+
+    private static void MakeLabelNonInteractive(GameObject labelRoot)
+    {
+        if (labelRoot == null) return;
+
+        var raycasters = labelRoot.GetComponentsInChildren<GraphicRaycaster>(true);
+        foreach (var r in raycasters)
+            if (r != null) r.enabled = false;
+
+        var graphics = labelRoot.GetComponentsInChildren<Graphic>(true);
+        foreach (var g in graphics)
+            if (g != null) g.raycastTarget = false;
+
+        SetLayerRecursive(labelRoot, 0);
+    }
+
+    // =========================
+    // Asset NameLabel (Fallback TextMesh)
     // =========================
     private static void CreateNameLabelOnAssetPanel(Transform panel, string text)
     {
@@ -1028,7 +1212,6 @@ public class PeakSigns : BaseUnityPlugin
             Transform panelT = root.transform.Find("Panel");
             if (panelT != null)
             {
-                // If procedural panel => MeshRenderer color via SetRendererColor
                 MeshRenderer pmr = panelT.GetComponent<MeshRenderer>();
                 if (pmr != null)
                     SetRendererColor(pmr, ownerColor);
